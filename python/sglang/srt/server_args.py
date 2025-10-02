@@ -179,6 +179,11 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # StreamingLLM (Attention Sinks)
+    enable_streaming_llm: bool = False
+    streaming_llm_window_length: int = 512
+    streaming_llm_num_sink_tokens: int = 4
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -1317,6 +1322,25 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # StreamingLLM (Attention Sinks)
+        parser.add_argument(
+            "--enable-streaming-llm",
+            action="store_true",
+            help="Enable StreamingLLM (Attention Sinks) for long context inference with fixed window size.",
+        )
+        parser.add_argument(
+            "--streaming-llm-window-length",
+            type=int,
+            default=ServerArgs.streaming_llm_window_length,
+            help="The window length for StreamingLLM. Tokens beyond this window will be evicted except for sink tokens.",
+        )
+        parser.add_argument(
+            "--streaming-llm-num-sink-tokens",
+            type=int,
+            default=ServerArgs.streaming_llm_num_sink_tokens,
+            help="The number of sink tokens to keep at the beginning of the sequence in StreamingLLM.",
         )
 
         # Optimization/debug options
