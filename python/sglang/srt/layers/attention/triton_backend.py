@@ -9,8 +9,8 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.streamingllm_utils import update_streamingllm_buffer
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2
 
@@ -35,6 +35,10 @@ class ForwardMetadata:
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
+    # StreamingLLM (sink + window)
+    streaming_kv_indptr: Optional[torch.Tensor] = None
+    streaming_kv_indices: Optional[torch.Tensor] = None
+    streaming_num_kv_splits: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -89,6 +93,19 @@ class TritonAttnBackend(AttentionBackend):
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
+        # StreamingLLM CSR pointer buffer (decode only; reused across steps)
+        # Created only when StreamingLLM is enabled to avoid extra memory footprint.
+        # TODO: maybe getattr is not necessary
+        self.streaming_kv_indptr = None
+        if (
+            getattr(model_runner.server_args, "enable_streaming_llm", False) is True
+            and getattr(model_runner.server_args, "streaming_llm_window_length", 0) > 0
+            and getattr(model_runner.server_args, "streaming_llm_num_sink_tokens", 0) >= 0
+        ):
+            self.streaming_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
+
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -120,6 +137,17 @@ class TritonAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+
+        # StreamingLLM configs
+        self.streaming_llm_enabled = (
+            getattr(model_runner.server_args, "enable_streaming_llm", False) is True
+        )
+        self.streaming_llm_window = getattr(
+            model_runner.server_args, "streaming_llm_window_length", 0
+        )
+        self.streaming_llm_sink = getattr(
+            model_runner.server_args, "streaming_llm_num_sink_tokens", 0
+        )
 
     def get_num_kv_splits(
         self,
@@ -166,6 +194,10 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         spec_info = forward_batch.spec_info
+        # StreamingLLM defaults (may stay None for non-decode or disabled cases)
+        streaming_kv_indptr = None
+        streaming_kv_indices = None
+        streaming_num_kv_splits = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -203,6 +235,44 @@ class TritonAttnBackend(AttentionBackend):
                         (bs,), dtype=torch.int32, device=self.device
                     )
                     self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
+
+                # StreamingLLM (sink + window). Only apply on decode and non-speculative.
+                streaming_kv_indptr = None
+                streaming_kv_indices = None
+                streaming_num_kv_splits = None
+                if (
+                    self.streaming_llm_enabled
+                    and self.streaming_llm_window is not None
+                    and self.streaming_llm_window > 0
+                    and self.streaming_llm_sink is not None
+                    and self.streaming_llm_sink >= 0
+                ):
+                    (
+                        streaming_kv_indptr,
+                        streaming_kv_indices,
+                        streaming_kv_lens,
+                    ) = update_streamingllm_buffer(
+                        req_to_token=self.req_to_token,
+                        sink_tokens=self.streaming_llm_sink,
+                        window_tokens=self.streaming_llm_window,
+                        seq_lens=forward_batch.seq_lens,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        bs=bs,
+                        device=self.device,
+                    )
+                    streaming_num_kv_splits = torch.empty(
+                        (bs,), dtype=torch.int32, device=self.device
+                    )
+                    self.get_num_kv_splits(
+                        streaming_num_kv_splits, streaming_kv_lens
+                    )
+                    if get_bool_env_var("SGLANG_LOG_STREAMING_KV"):
+                        try:
+                            print(
+                                f"[StreamingLLM][eager] bs={bs} kv_total={int(streaming_kv_indptr[-1].item())} sum_seq={int(forward_batch.seq_lens.sum().item())}"
+                            )
+                        except Exception:
+                            pass
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -333,6 +403,9 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
+            streaming_kv_indptr,
+            streaming_kv_indices,
+            streaming_num_kv_splits,
         )
 
     def init_cuda_graph_state(
@@ -387,6 +460,29 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        # StreamingLLM buffers for CUDA Graph (only when enabled)
+        if (
+            self.streaming_llm_enabled
+            and self.streaming_llm_window is not None
+            and self.streaming_llm_window > 0
+            and self.streaming_llm_sink is not None
+            and self.streaming_llm_sink >= 0
+        ):
+            # Max streaming span per sequence: union(first S sink, last W tokens).
+            # Its theoretical upper bound is S + W, but also cannot exceed max_context_len.
+            max_streaming_span = min(
+                self.max_context_len,
+                int(self.streaming_llm_sink) + int(self.streaming_llm_window),
+            )
+            # Allocate big flat buffer for indices with static shape for CUDA Graph
+            self.cuda_graph_streaming_kv_indices = torch.zeros(
+                (max_num_tokens * max_streaming_span), dtype=torch.int32, device=self.device
+            )
+            # Per-token split counts placeholder; will be recomputed on replay
+            self.cuda_graph_streaming_num_kv_splits = torch.full(
+                (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
+            )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -401,6 +497,10 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
+        # Defaults for StreamingLLM metadata in CUDA Graph capture
+        streaming_kv_indptr = None
+        streaming_kv_indices = None
+        streaming_num_kv_splits = None
 
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -432,6 +532,43 @@ class TritonAttnBackend(AttentionBackend):
                         req_pool_indices,
                         bs,
                     )
+                # StreamingLLM (decode + non-speculative) for CUDA Graph capture.
+                if (
+                    self.streaming_llm_enabled
+                    and self.streaming_llm_window is not None
+                    and self.streaming_llm_window > 0
+                    and self.streaming_llm_sink is not None
+                    and self.streaming_llm_sink >= 0
+                ):
+                    # Reuse eager util to build indices, then copy into graph buffers.
+                    (
+                        streaming_kv_indptr_tmp,
+                        streaming_kv_indices_tmp,
+                        streaming_kv_lens_tmp,
+                    ) = update_streamingllm_buffer(
+                        req_to_token=self.req_to_token,
+                        sink_tokens=self.streaming_llm_sink,
+                        window_tokens=self.streaming_llm_window,
+                        seq_lens=seq_lens[:bs],
+                        req_pool_indices=req_pool_indices,
+                        bs=bs,
+                        device=self.device,
+                    )
+                    # Write into preallocated graph buffers
+                    self.streaming_kv_indptr[: bs + 1].copy_(streaming_kv_indptr_tmp)
+                    total = int(streaming_kv_indptr_tmp[-1].item())
+                    if total > 0:
+                        self.cuda_graph_streaming_kv_indices[:total].copy_(
+                            streaming_kv_indices_tmp
+                        )
+                    # Optionally log once per capture for sanity check
+                    if get_bool_env_var("SGLANG_LOG_STREAMING_KV"):
+                        try:
+                            print(
+                                f"[StreamingLLM][graph-capture] bs={bs} kv_total={total} sum_seq={int(seq_lens[:bs].sum().item())}"
+                            )
+                        except Exception:
+                            pass
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -442,6 +579,19 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
+
+            # Fill forward metadata with StreamingLLM buffers (no dynamic split computation at capture)
+            if (
+                self.streaming_llm_enabled
+                and self.streaming_llm_window is not None
+                and self.streaming_llm_window > 0
+                and self.streaming_llm_sink is not None
+                and self.streaming_llm_sink >= 0
+            ):
+                streaming_kv_indptr = self.streaming_kv_indptr
+                streaming_kv_indptr = streaming_kv_indptr[: bs + 1]
+                streaming_kv_indices = self.cuda_graph_streaming_kv_indices
+                streaming_num_kv_splits = self.cuda_graph_streaming_num_kv_splits
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -519,6 +669,9 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
+            streaming_kv_indptr,
+            streaming_kv_indices,
+            streaming_num_kv_splits,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -569,6 +722,46 @@ class TritonAttnBackend(AttentionBackend):
                     self.get_num_kv_splits(
                         window_num_kv_splits[:num_token], window_kv_lens[:bs]
                     )
+
+                # StreamingLLM (decode + non-speculative) for CUDA Graph replay.
+                if (
+                    self.streaming_llm_enabled
+                    and self.streaming_llm_window is not None
+                    and self.streaming_llm_window > 0
+                    and self.streaming_llm_sink is not None
+                    and self.streaming_llm_sink >= 0
+                ):
+                    (
+                        streaming_kv_indptr_tmp,
+                        streaming_kv_indices_tmp,
+                        streaming_kv_lens_tmp,
+                    ) = update_streamingllm_buffer(
+                        req_to_token=self.req_to_token,
+                        sink_tokens=self.streaming_llm_sink,
+                        window_tokens=self.streaming_llm_window,
+                        seq_lens=seq_lens[:bs],
+                        req_pool_indices=req_pool_indices[:bs],
+                        bs=bs,
+                        device=self.device,
+                    )
+                    self.streaming_kv_indptr[: bs + 1].copy_(streaming_kv_indptr_tmp)
+                    total_streaming = int(streaming_kv_indptr_tmp[-1].item())
+                    if total_streaming > 0:
+                        self.cuda_graph_streaming_kv_indices[:total_streaming].copy_(
+                            streaming_kv_indices_tmp
+                        )
+                    # Recompute num_kv_splits for streaming path (effective prefix)
+                    self.get_num_kv_splits(
+                        self.cuda_graph_streaming_num_kv_splits[:num_token],
+                        streaming_kv_lens_tmp[:bs],
+                    )
+                    if get_bool_env_var("SGLANG_LOG_STREAMING_KV"):
+                        try:
+                            print(
+                                f"[StreamingLLM][graph-replay] bs={bs} kv_total={total_streaming} sum_seq={int(seq_lens[:bs].sum().item())}"
+                            )
+                        except Exception:
+                            pass
 
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
@@ -649,6 +842,8 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # Local import to avoid circular import at module load time
+        from sglang.srt.layers.radix_attention import AttentionType
         causal = True
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -709,11 +904,32 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
+            # Prefer StreamingLLM if enabled
+            if self.forward_metadata.streaming_kv_indptr is not None:
+                kv_indptr = self.forward_metadata.streaming_kv_indptr
+                kv_indices = self.forward_metadata.streaming_kv_indices
+                num_kv_splits = (
+                    self.forward_metadata.streaming_num_kv_splits
+                    if self.forward_metadata.streaming_num_kv_splits is not None
+                    else self.forward_metadata.num_kv_splits
+                )
+            else:
+                kv_indptr = self.forward_metadata.window_kv_indptr
+                kv_indices = self.forward_metadata.window_kv_indices
+                num_kv_splits = self.forward_metadata.num_kv_splits
         else:
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
+            if self.forward_metadata.streaming_kv_indptr is not None:
+                kv_indptr = self.forward_metadata.streaming_kv_indptr
+                kv_indices = self.forward_metadata.streaming_kv_indices
+                num_kv_splits = (
+                    self.forward_metadata.streaming_num_kv_splits
+                    if self.forward_metadata.streaming_num_kv_splits is not None
+                    else self.forward_metadata.num_kv_splits
+                )
+            else:
+                kv_indptr = self.forward_metadata.kv_indptr
+                kv_indices = self.forward_metadata.kv_indices
+                num_kv_splits = self.forward_metadata.num_kv_splits
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -724,10 +940,11 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
+            num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
             layer.logit_cap,
+            layer.layer_id,
         )
         return o
 
