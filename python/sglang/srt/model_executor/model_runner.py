@@ -26,6 +26,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+normal_repr = torch.Tensor.__repr__
+torch.Tensor.__repr__ = lambda self: f"{tuple(self.shape)} {normal_repr(self)}"
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -290,6 +293,14 @@ class ModelRunner:
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
+        # Init Double Sparsity
+        if server_args.enable_double_sparsity:
+            if server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -407,11 +418,6 @@ class ModelRunner:
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
