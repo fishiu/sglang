@@ -1,4 +1,5 @@
 import os
+import shlex
 import unittest
 from types import SimpleNamespace
 
@@ -223,28 +224,42 @@ class TestStreamingLlmAcc(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Allow overriding server args from environment for flexible CLI usage
+        # Full override: set SGL_TEST_SERVER_OTHER_ARGS to a shell-style string
+        env_other_args = os.getenv("SGL_TEST_SERVER_OTHER_ARGS")
+        if env_other_args:
+            other_args = shlex.split(env_other_args)
+        else:
+            # Fine-grained overrides via individual env vars
+            window_len = os.getenv("SGL_TEST_STREAMING_WINDOW_LENGTH", "1024")
+            sink_tokens = os.getenv("SGL_TEST_STREAMING_SINK_TOKENS", "4")
+            attention_backend = os.getenv("SGL_TEST_ATTENTION_BACKEND", "triton")
+            max_total_tokens = os.getenv("SGL_TEST_MAX_TOTAL_TOKENS", "200000")
+            disable_cuda_graph_env = os.getenv("SGL_TEST_DISABLE_CUDA_GRAPH", "0")
+
+            other_args = [
+                "--enable-streaming-llm",
+                "--streaming-llm-window-length",
+                str(window_len),
+                "--streaming-llm-num-sink-tokens",
+                str(sink_tokens),
+                "--attention-backend",
+                str(attention_backend),
+                "--max-total-tokens",
+                str(max_total_tokens),
+                "--random-seed",
+                "1107",
+            ]
+            print(f"[StreamingLLM][Acc] other_args: {other_args}", flush=True)
+            # Include or exclude --disable-cuda-graph based on env flag (default: include)
+            if disable_cuda_graph_env.lower() in {"1", "true", "yes", "y"}:
+                other_args.append("--disable-cuda-graph")
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-llm",
-                "--streaming-llm-window-length",
-                "512",
-                "--streaming-llm-num-sink-tokens",
-                "4",
-                "--attention-backend",
-                "triton",
-                "--max-total-tokens",
-                "200000",
-                "--disable-cuda-graph",
-            ],
-            # other_args=[
-            #     "--attention-backend",
-            #     "triton",
-            #     "--max-total-tokens",
-            #     "200000",
-            # ],
+            other_args=other_args,
         )
 
     @classmethod
