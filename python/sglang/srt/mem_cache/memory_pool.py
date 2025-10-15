@@ -818,6 +818,23 @@ class MLATokenToKVPool(KVCache):
 
 
 class DoubleSparseTokenToKVPool(KVCache):
+    """
+    Double Sparsity 的 KV 池。
+
+    与标准 KV 池相比，额外维护 label_buffer：
+    - k_buffer: 每层 [size + page_size, head_num, head_dim] 的 K
+    - v_buffer: 每层 [size + page_size, head_num, head_dim] 的 V
+    - label_buffer: 每层 [size + 1, head_num, heavy_channel_num] 的“通道子集”缓冲
+
+    设计要点：
+    - 在 extend/decode 写入 KV 时，同时根据 per-layer 的 sorted_channels 写入对应 token 的 label 子向量，
+      使得解码阶段的近似打分可以直接从 label_buffer 读取。
+    - get_label_buffer(layer_id) 提供给 Triton 稀疏解码核使用。
+
+    示例
+    - 假设 head_dim=128，heavy_channel_num=32。
+      对于某 token 的 K 向量 K[token, head, 0..127]，我们会在 label_buffer 中保存其中 32 个通道（顺序为 sorted_channels 指定）。
+    """
     def __init__(
         self,
         size: int,
@@ -889,6 +906,15 @@ class DoubleSparseTokenToKVPool(KVCache):
         cache_v: torch.Tensor,
         cache_label: torch.Tensor,
     ):
+        """
+        同步写入 K/V 与 label。
+
+        输入
+        - layer: 提供当前层 id
+        - loc: [N]，要写入的全局 token 索引位置
+        - cache_k/cache_v: [N, head_num, head_dim]
+        - cache_label: [N, head_num, heavy_channel_num]，按 sorted_channels 选出的通道子向量
+        """
         # NOTE(Andy): ignore the dtype check
         layer_id = layer.layer_id
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
