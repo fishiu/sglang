@@ -824,7 +824,7 @@ class DoubleSparseTokenToKVPool(KVCache):
     与标准 KV 池相比，额外维护 label_buffer：
     - k_buffer: 每层 [size + page_size, head_num, head_dim] 的 K
     - v_buffer: 每层 [size + page_size, head_num, head_dim] 的 V
-    - label_buffer: 每层 [size + 1, head_num, heavy_channel_num] 的“通道子集”缓冲
+    - label_buffer: 每层 [size + 1, head_num, heavy_channel_num] 的"通道子集"缓冲
 
     设计要点：
     - 在 extend/decode 写入 KV 时，同时根据 per-layer 的 sorted_channels 写入对应 token 的 label 子向量，
@@ -927,6 +927,163 @@ class DoubleSparseTokenToKVPool(KVCache):
     def transfer(self, indices, flat_data):
         pass
 
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        pass
+
+
+class QuestTokenToKVPool(KVCache):
+    """
+    Quest KV Pool - 维护 page-level 元数据以支持 Query-Aware Sparsity
+    
+    核心组成：
+    - k_buffer/v_buffer: 标准 KV cache [size + page_size, head_num, head_dim]
+    - k_metadata: page-level 元数据 [num_pages, head_num, head_dim, 2]
+      - [..., 0]: 该 page 内所有 K 向量的 min 值
+      - [..., 1]: 该 page 内所有 K 向量的 max 值
+    - metadata_initialized: 标记哪些 page 的元数据已初始化 [num_pages, head_num]
+    
+    设计原理：
+    - Prefill 阶段：只写 KV cache，不计算元数据
+    - Decode 第一步：懒初始化 - 从 KV cache 回读计算所有 prefill pages 的 min/max
+    - Decode 后续步：增量更新当前 page 的 min/max
+    """
+    
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+        
+        self.head_num = head_num
+        self.head_dim = head_dim
+        
+        # FP16 数值稳定性
+        if dtype == torch.float16:
+            self.pos_inf = 65504.0
+            self.neg_inf = -65504.0
+        else:
+            self.pos_inf = float('inf')
+            self.neg_inf = float('-inf')
+        
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # 基础 KV buffer (与 MHATokenToKVPool 一致)
+            self.k_buffer = [
+                torch.zeros(
+                    (size + page_size, head_num, head_dim),
+                    dtype=self.store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (size + page_size, head_num, head_dim),
+                    dtype=self.store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            
+            # Quest 特有: page-level 元数据
+            num_pages = (size + page_size - 1) // page_size + 1  # +1 for safety
+            self.k_metadata = [
+                torch.empty(
+                    (num_pages, head_num, head_dim, 2),
+                    dtype=dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            
+            # 初始化元数据为极值（标记未初始化）
+            for meta in self.k_metadata:
+                meta[..., 0].fill_(self.pos_inf)  # min 初始化为 +inf
+                meta[..., 1].fill_(self.neg_inf)  # max 初始化为 -inf
+        
+        # 初始化标记（用于判断 page 是否已计算过元数据）
+        self.metadata_initialized = [
+            torch.zeros((num_pages, head_num), dtype=torch.bool, device=device)
+            for _ in range(layer_num)
+        ]
+        
+        logger.info(
+            f"Quest KV Cache allocated: {size} tokens, {num_pages} pages, "
+            f"page_size={page_size}, metadata shape={self.k_metadata[0].shape}"
+        )
+    
+    def get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+    
+    def get_value_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
+    
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+    
+    def get_metadata_buffer(self, layer_id: int):
+        """获取元数据 buffer: [num_pages, head_num, head_dim, 2]"""
+        return self.k_metadata[layer_id - self.start_layer]
+    
+    def get_metadata_init_flag(self, layer_id: int):
+        """获取初始化标记: [num_pages, head_num]"""
+        return self.metadata_initialized[layer_id - self.start_layer]
+    
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """
+        写入 KV cache（标准路径，不更新元数据）
+        
+        用于 extend 阶段或非 Quest 模式。
+        元数据更新在 Quest backend 的 update_metadata 中单独处理。
+        """
+        layer_id = layer.layer_id
+        
+        # 类型转换
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+        
+        # 写入 KV buffer
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+    
+    def get_flat_data(self, indices):
+        pass
+    
+    def transfer(self, indices, flat_data):
+        pass
+    
     def transfer_per_layer(self, indices, flat_data, layer_id):
         pass
 

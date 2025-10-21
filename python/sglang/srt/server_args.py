@@ -179,6 +179,10 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # Quest (Query-Aware Sparsity)
+    enable_quest: bool = False
+    quest_topk: int = 16  # Maximum number of pages to keep (excluding last page)
+
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
     streaming_llm_window_length: int = 512
@@ -1322,6 +1326,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # Quest (Query-Aware Sparsity)
+        parser.add_argument(
+            "--enable-quest",
+            action="store_true",
+            help="Enable Quest (Query-Aware Sparsity) for efficient long-context inference using page-level metadata.",
+        )
+        parser.add_argument(
+            "--quest-topk",
+            type=int,
+            default=ServerArgs.quest_topk,
+            help="Maximum number of pages to keep in Quest sparse attention (excluding last page). Default: 16",
         )
 
         # StreamingLLM (Attention Sinks)
