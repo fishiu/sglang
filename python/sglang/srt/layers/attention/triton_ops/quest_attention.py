@@ -15,6 +15,7 @@ Quest Attention Triton Kernels
 import torch
 import triton
 import triton.language as tl
+import torch.cuda.nvtx as nvtx
 
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
@@ -48,16 +49,16 @@ def _quest_decode_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    stride_indptr_b,    # kv_indptr 的 batch stride
-    stride_indptr_h,    # kv_indptr 的 head stride
-    kv_group_num: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    MIN_BLOCK_KV: tl.constexpr,
-    logit_cap: tl.constexpr,
-    Lk: tl.constexpr,
-    Lv: tl.constexpr,
+    stride_indptr_b,    # kv_indptr 的 batch stride 20
+    stride_indptr_h,    # kv_indptr 的 head stride 1
+    kv_group_num: tl.constexpr,  # 1
+    BLOCK_DMODEL: tl.constexpr,  # 128
+    BLOCK_DV: tl.constexpr,  # 128
+    BLOCK_N: tl.constexpr,  # 64
+    MIN_BLOCK_KV: tl.constexpr,  # 16
+    logit_cap: tl.constexpr,  # 0.0
+    Lk: tl.constexpr,  # 128
+    Lv: tl.constexpr,  # 128
 ):
     """
     Quest Decode Stage1: 支持 per-head 的 kv_indptr
@@ -66,16 +67,16 @@ def _quest_decode_kernel_stage1(
     - kv_indptr 有 head 维度：[batch+1, num_heads]
     - 每个 head 从 kv_indptr[cur_batch, cur_head] 获取起始位置
     """
-    cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    split_kv_id = tl.program_id(2)
+    cur_batch = tl.program_id(0)  # 0
+    cur_head = tl.program_id(1)  # 0
+    split_kv_id = tl.program_id(2)  # 0
     
-    cur_kv_head = cur_head // kv_group_num
+    cur_kv_head = cur_head // kv_group_num  # 0 // 1 = 0
     
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_d = offs_d < Lk
-    mask_dv = offs_dv < Lv
+    offs_d = tl.arange(0, BLOCK_DMODEL)  # 0 ... 127
+    offs_dv = tl.arange(0, BLOCK_DV)  # 0 ... 127
+    mask_d = offs_d < Lk  # true, true, ..., true
+    mask_dv = offs_dv < Lv # true, true, ..., true
     
     # 从 per-head kv_indptr 获取当前 (batch, head) 的 KV 范围
     # kv_indptr: [batch+1, num_heads]
@@ -84,7 +85,7 @@ def _quest_decode_kernel_stage1(
     )
     cur_batch_kv_end_idx = tl.load(
         kv_indptr + (cur_batch + 1) * stride_indptr_b + cur_head * stride_indptr_h
-    )
+    )  # 257
     cur_batch_seq_len = cur_batch_kv_end_idx - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
     
@@ -271,6 +272,7 @@ def quest_decode_attention_fwd(
     max_kv_splits,  # int
     sm_scale,       # float
     logit_cap=0.0,
+    layer_id=None,
 ):
     """
     Quest Decode Attention Forward (两阶段)
@@ -293,6 +295,10 @@ def quest_decode_attention_fwd(
     num_warps = 4 if kv_group_num == 1 else 2
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
+
+    if layer_id == 0:
+        print(f"PUSH quest_decode_attention_fwd_stage1")
+        nvtx.range_push(f"quest_attnl0")
     
     _quest_decode_kernel_stage1[grid](
         q,
@@ -319,13 +325,16 @@ def quest_decode_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
-        MIN_BLOCK_KV=32,
+        MIN_BLOCK_KV=16,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
     )
+
+    if layer_id == 0:
+        nvtx.range_pop()
     
     # Stage2: 聚合结果
     grid = (batch, head_num)

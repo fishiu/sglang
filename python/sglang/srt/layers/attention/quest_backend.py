@@ -248,6 +248,7 @@ class QuestAttnBackend(AttentionBackend):
             max_kv_splits=self.max_kv_splits,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            layer_id=layer.layer_id,
         )
         
         return o

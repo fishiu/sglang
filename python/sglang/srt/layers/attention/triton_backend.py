@@ -1091,15 +1091,15 @@ class TritonMultiStepDraftBackend:
 
 @triton.jit
 def get_num_kv_splits_triton(
-    num_kv_splits_ptr,
-    seq_lens_ptr,
-    num_seq,
-    num_group,
-    num_head,
-    num_kv_head,
-    max_kv_splits,
-    device_core_count,
-    MAX_NUM_SEQ: tl.constexpr,
+    num_kv_splits_ptr,          # 输出：分块数量数组的指针
+    seq_lens_ptr,               # 输入：序列长度数组的指针
+    num_seq,                    # 输入：序列数量
+    num_group,                  # 输入：推测解码的 token group 数量（普通情况为 1）
+    num_head,                   # 输入：Query head 数量
+    num_kv_head,                # 输入：KV head 数量
+    max_kv_splits,              # 输入：最大分块数上限
+    device_core_count,          # 输入：GPU 核心数
+    MAX_NUM_SEQ: tl.constexpr,  # 编译时常量：并行处理的序列数（2的幂次）
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
