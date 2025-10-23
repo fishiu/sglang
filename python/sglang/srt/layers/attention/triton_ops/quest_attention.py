@@ -17,8 +17,6 @@ import triton
 import triton.language as tl
 import torch.cuda.nvtx as nvtx
 
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-
 
 @triton.jit
 def tanh(x):
@@ -35,7 +33,7 @@ def _quest_decode_kernel_stage1(
     K_Buffer,           # [size, num_heads, head_dim]
     V_Buffer,           # [size, num_heads, v_head_dim]
     sm_scale,           # float
-    kv_indptr,          # [batch + 1, num_heads] - per-head CSR pointers
+    kv_indptr,          # [batch + 1] - 每个 batch 的 token 数量（所有 head 相同）
     kv_indices,         # [total_selected_tokens] - flat token indices
     Att_Out,            # [batch, num_heads, max_kv_splits, v_head_dim]
     Att_Lse,            # [batch, num_heads, max_kv_splits]
@@ -50,8 +48,6 @@ def _quest_decode_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    stride_indptr_b,    # kv_indptr 的 batch stride 20
-    stride_indptr_h,    # kv_indptr 的 head stride 1
     kv_group_num: tl.constexpr,  # 1
     BLOCK_DMODEL: tl.constexpr,  # 128
     BLOCK_DV: tl.constexpr,  # 128
@@ -60,15 +56,15 @@ def _quest_decode_kernel_stage1(
     logit_cap: tl.constexpr,  # 0.0
     Lk: tl.constexpr,  # 128
     Lv: tl.constexpr,  # 128
-    head_num: tl.constexpr,  # num_heads
-    MAX_KV_SPLITS: tl.constexpr,  # max_kv_splits
+    head_num: tl.constexpr,  # num_heads, for debug
+    MAX_KV_SPLITS: tl.constexpr,  # max_kv_splits, for debug
 ):
     """
-    Quest Decode Stage1: 支持 per-head 的 kv_indptr
+    Quest Decode Stage1: 简化版（所有 head 选中相同数量的 tokens）
     
     与标准 decode kernel 的主要区别：
-    - kv_indptr 有 head 维度：[batch+1, num_heads]
-    - 每个 head 从 kv_indptr[cur_batch, cur_head] 获取起始位置
+    - kv_indptr 无 head 维度：[batch+1]，所有 head 共享相同的 token 数量
+    - 每个 head 从 kv_indices[cur_head * tokens_per_head] 开始读取
     """
     cur_batch = tl.program_id(0)  # 0
     cur_head = tl.program_id(1)  # 0
@@ -81,15 +77,13 @@ def _quest_decode_kernel_stage1(
     mask_d = offs_d < Lk  # true, true, ..., true
     mask_dv = offs_dv < Lv # true, true, ..., true
     
-    # 从 per-head kv_indptr 获取当前 (batch, head) 的 KV 范围
-    # kv_indptr: [batch+1, num_heads]
-    cur_batch_kv_start_idx = tl.load(
-        kv_indptr + cur_batch * stride_indptr_b + cur_head * stride_indptr_h
-    )
-    cur_batch_kv_end_idx = tl.load(
-        kv_indptr + (cur_batch + 1) * stride_indptr_b + cur_head * stride_indptr_h
-    )  # 257
-    cur_batch_seq_len = cur_batch_kv_end_idx - cur_batch_kv_start_idx
+    # 从 kv_indptr 获取当前 batch 的 token 数量（所有 head 相同）
+    # kv_indptr: [batch+1]
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+    
+    # 当前 head 在 kv_indices 中的起始偏移
+    cur_batch_kv_start_idx = cur_head * cur_batch_seq_len
+    
     kv_splits = tl.load(num_kv_splits + cur_batch)
     
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
@@ -202,15 +196,13 @@ def _quest_decode_kernel_stage2(
     Mid_O,          # [batch, num_heads, max_kv_splits, v_head_dim]
     Mid_O_1,        # [batch, num_heads, max_kv_splits]
     O,              # [batch, num_heads, v_head_dim]
-    kv_indptr,      # [batch + 1, num_heads]
+    kv_indptr,      # [batch + 1]
     num_kv_splits,  # [batch]
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     stride_obs,
     stride_oh,
-    stride_indptr_b,
-    stride_indptr_h,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -219,17 +211,13 @@ def _quest_decode_kernel_stage2(
     """
     Quest Decode Stage2: 聚合 stage1 的结果
     
-    与标准版本一致，只是 kv_indptr 有 head 维度
+    简化版：kv_indptr 无 head 维度，所有 head 共享相同的 token 数量
     """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     
-    # 从 per-head kv_indptr 获取序列长度
-    cur_batch_seq_len = tl.load(
-        kv_indptr + (cur_batch + 1) * stride_indptr_b + cur_head * stride_indptr_h
-    ) - tl.load(
-        kv_indptr + cur_batch * stride_indptr_b + cur_head * stride_indptr_h
-    )
+    # 从 kv_indptr 获取序列长度（所有 head 相同）
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     kv_splits = tl.load(num_kv_splits + cur_batch)
     
     offs_d = tl.arange(0, BLOCK_DV)
@@ -278,7 +266,7 @@ def quest_decode_attention_fwd(
     k_buffer,       # [size, num_heads, head_dim]
     v_buffer,       # [size, num_heads, v_head_dim]
     o,              # [batch, num_heads, v_head_dim]
-    kv_indptr,      # [batch + 1, num_heads] - per-head CSR pointers
+    kv_indptr,      # [batch + 1] - 所有 head 共享相同的 token 数量
     kv_indices,     # [total_selected_tokens]
     attn_logits,    # [batch, num_heads, max_kv_splits, v_head_dim]
     attn_lse,       # [batch, num_heads, max_kv_splits]
@@ -291,9 +279,9 @@ def quest_decode_attention_fwd(
     """
     Quest Decode Attention Forward (两阶段)
     
-    与标准 decode_attention_fwd 的区别：
-    - kv_indptr 有 head 维度：[batch+1, num_heads]
-    - 每个 head 可以有不同的选中 tokens（Quest TopK）
+    简化版：
+    - kv_indptr 无 head 维度：[batch+1]
+    - 所有 head 选中相同数量的 tokens（Quest TopK）
     """
     BLOCK = 64
     Lk = k_buffer.shape[-1]
@@ -337,8 +325,6 @@ def quest_decode_attention_fwd(
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
-        kv_indptr.stride(0),
-        kv_indptr.stride(1),
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -386,8 +372,6 @@ def quest_decode_attention_fwd(
         attn_logits.stride(2),
         o.stride(0),
         o.stride(1),
-        kv_indptr.stride(0),
-        kv_indptr.stride(1),
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=32,
         BLOCK_DV=BLOCK_DV,
@@ -519,15 +503,15 @@ def quest_select_topk_pages(
     """
     TopK Selection: 选择得分最高的 K 个 pages + last page
     
-    返回 CSR 格式的索引（per-head）：
-    - kv_indptr: [batch + 1, num_heads]  # 注意：第一维是 batch+1，第二维是 num_heads
-    - kv_indices: [total_selected_tokens]
+    返回 CSR 格式的索引（简化版，所有 head 选中数量相同）：
+    - kv_indptr: [batch + 1]  # 每个 batch 的 token 数量（每个 head 相同）
+    - kv_indices: [total_selected_tokens]  # 所有 head 的 token indices 拼接
     
     核心逻辑：
     1. 对每个 (batch, head)，在前 num_pages-1 个 pages 中选 TopK
     2. 强制追加 last_page_idx
     3. 展开 pages 为 token indices
-    4. 转换为 CSR 格式（per-head）
+    4. 转换为 CSR 格式（所有 head 共享相同的 token 数量）
     """
     batch_size, num_heads, max_pages = estimated_scores.shape
     device = estimated_scores.device
@@ -544,15 +528,10 @@ def quest_select_topk_pages(
     # 判断是否需要稀疏化
     if num_pages <= quest_topk + 1:
         # 退化为稠密：保留所有 pages
-        # kv_indptr: [batch+1, num_heads] = [2, num_heads]
-        # 每个 head 独立的 CSR 范围
-        kv_indptr = torch.zeros((batch_size + 1, num_heads), dtype=torch.int32, device=device)
-        # Head h 的范围: [h*seq_len, (h+1)*seq_len]
-        head_offsets = torch.arange(num_heads, dtype=torch.int32, device=device) * seq_len
-        kv_indptr[0, :] = head_offsets
-        kv_indptr[1, :] = head_offsets + seq_len
+        # kv_indptr: [batch+1] - 所有 head 共享相同的 token 数量
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         
-        # kv_indices: 每个 head 都是完整的 [0, 1, ..., seq_len-1]
+        # kv_indices: 每个 head 都是完整的 [0, 1, ..., seq_len-1]，拼接在一起
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         kv_indices = kv_indices.unsqueeze(0).expand(num_heads, -1).reshape(-1)
         
@@ -580,18 +559,16 @@ def quest_select_topk_pages(
     page_ends = torch.clamp(page_starts + page_size, max=seq_len)  # [num_heads, k+1]
     page_lens = page_ends - page_starts  # [num_heads, k+1] - 每个 page 的有效 token 数
     
-    # 2. 计算 kv_indptr（每个 head 的独立 CSR 范围）
+    # 2. 计算 kv_indptr（所有 head 共享相同的 token 数量）
     tokens_per_head = page_lens.sum(dim=1)  # [num_heads]
-    kv_indptr = torch.zeros((batch_size + 1, num_heads), dtype=torch.int32, device=device)
-    # 使用 cumsum 生成每个 head 的起止位置
-    cumsum = torch.cumsum(tokens_per_head, dim=0)  # [num_heads]
-    kv_indptr[0, 1:] = cumsum[:-1]  # 每个 head 的起始位置（除了第一个）
-    kv_indptr[0, 0] = 0  # 第一个 head 从 0 开始
-    kv_indptr[1, :] = cumsum  # 每个 head 的结束位置
+    # 所有 head 选中的 token 数量应该相同
+    assert tokens_per_head.min() == tokens_per_head.max(), "All heads should have the same number of tokens"
+    tokens_count = tokens_per_head[0].item()
+    kv_indptr = torch.tensor([0, tokens_count], dtype=torch.int32, device=device)
     
     # 3. 批量生成所有 token indices（关键优化）
     # 使用 repeat_interleave 避免循环
-    total_tokens = kv_indptr[1, -1].item()
+    total_tokens = kv_indptr[1].item() * num_heads
     
     # 方法：为每个 (head, page) 生成其对应的 token indices
     # 使用 repeat + mask 批量生成
