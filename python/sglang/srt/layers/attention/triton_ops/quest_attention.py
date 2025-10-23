@@ -40,6 +40,7 @@ def _quest_decode_kernel_stage1(
     Att_Out,            # [batch, num_heads, max_kv_splits, v_head_dim]
     Att_Lse,            # [batch, num_heads, max_kv_splits]
     num_kv_splits,      # [batch]
+    Debug_Info,         # [batch, num_heads, max_kv_splits, 5] - debug info
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -59,6 +60,8 @@ def _quest_decode_kernel_stage1(
     logit_cap: tl.constexpr,  # 0.0
     Lk: tl.constexpr,  # 128
     Lv: tl.constexpr,  # 128
+    head_num: tl.constexpr,  # num_heads
+    MAX_KV_SPLITS: tl.constexpr,  # max_kv_splits
 ):
     """
     Quest Decode Stage1: 支持 per-head 的 kv_indptr
@@ -94,9 +97,20 @@ def _quest_decode_kernel_stage1(
     # 计算当前 split 的范围
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    )  # div(div(257, 8), 16)*16=48 很浪费就差一点点就32了
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    
+    # # Calculate loop iterations for debugging
+    # loop_iters = tl.cdiv(tl.maximum(split_kv_end - split_kv_start, 0), BLOCK_N)
+    
+    # # Store debug info: [cur_batch_seq_len, kv_len_per_split, split_kv_start, split_kv_end, loop_iters]
+    # debug_offset = cur_batch * (head_num * MAX_KV_SPLITS * 5) + cur_head * (MAX_KV_SPLITS * 5) + split_kv_id * 5
+    # tl.store(Debug_Info + debug_offset + 0, cur_batch_seq_len)
+    # tl.store(Debug_Info + debug_offset + 1, kv_len_per_split)
+    # tl.store(Debug_Info + debug_offset + 2, split_kv_start)
+    # tl.store(Debug_Info + debug_offset + 3, split_kv_end)
+    # tl.store(Debug_Info + debug_offset + 4, loop_iters)
     
     # 初始化 online softmax 变量
     e_max = -float("inf")
@@ -296,6 +310,9 @@ def quest_decode_attention_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    # Create debug info tensor: [batch, num_heads, max_kv_splits, 5]
+    debug_info = torch.zeros((batch, head_num, MAX_KV_SPLITS, 5), dtype=torch.int32, device=q.device)
+    
     if layer_id == 0:
         print(f"PUSH quest_decode_attention_fwd_stage1")
         nvtx.range_push(f"quest_attnl0")
@@ -310,6 +327,7 @@ def quest_decode_attention_fwd(
         attn_logits,
         attn_lse,
         num_kv_splits,
+        debug_info,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
@@ -331,10 +349,29 @@ def quest_decode_attention_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        head_num=head_num,
+        MAX_KV_SPLITS=MAX_KV_SPLITS,
     )
 
     if layer_id == 0:
         nvtx.range_pop()
+        
+    # # Print debug info in a readable format
+    # print("\n" + "="*80)
+    # print(f"DEBUG INFO - Grid: {grid}")
+    # print("="*80)
+    # debug_cpu = debug_info.cpu()
+    # for b in range(batch):
+    #     for h in range(head_num):
+    #         print(f"\n[Batch {b}, Head {h}]")
+    #         print(f"  {'Split':<8} {'SeqLen':<10} {'LenPerSplit':<15} {'Start':<10} {'End':<10} {'LoopIters':<10}")
+    #         print(f"  {'-'*8} {'-'*10} {'-'*15} {'-'*10} {'-'*10} {'-'*10}")
+    #         for s in range(MAX_KV_SPLITS):
+    #             info = debug_cpu[b, h, s]
+    #             seq_len, len_per_split, start, end, loop_iters = info[0].item(), info[1].item(), info[2].item(), info[3].item(), info[4].item()
+    #             if seq_len > 0:  # Only print if valid
+    #                 print(f"  {s:<8} {seq_len:<10} {len_per_split:<15} {start:<10} {end:<10} {loop_iters:<10}")
+    # print("="*80 + "\n")
     
     # Stage2: 聚合结果
     grid = (batch, head_num)
@@ -508,9 +545,12 @@ def quest_select_topk_pages(
     if num_pages <= quest_topk + 1:
         # 退化为稠密：保留所有 pages
         # kv_indptr: [batch+1, num_heads] = [2, num_heads]
-        # 第一个 batch 行全为 0，第二个 batch 行全为 seq_len
+        # 每个 head 独立的 CSR 范围
         kv_indptr = torch.zeros((batch_size + 1, num_heads), dtype=torch.int32, device=device)
-        kv_indptr[1, :] = seq_len
+        # Head h 的范围: [h*seq_len, (h+1)*seq_len]
+        head_offsets = torch.arange(num_heads, dtype=torch.int32, device=device) * seq_len
+        kv_indptr[0, :] = head_offsets
+        kv_indptr[1, :] = head_offsets + seq_len
         
         # kv_indices: 每个 head 都是完整的 [0, 1, ..., seq_len-1]
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
@@ -540,10 +580,14 @@ def quest_select_topk_pages(
     page_ends = torch.clamp(page_starts + page_size, max=seq_len)  # [num_heads, k+1]
     page_lens = page_ends - page_starts  # [num_heads, k+1] - 每个 page 的有效 token 数
     
-    # 2. 计算 kv_indptr（每个 head 的累积 token 数）
+    # 2. 计算 kv_indptr（每个 head 的独立 CSR 范围）
     tokens_per_head = page_lens.sum(dim=1)  # [num_heads]
     kv_indptr = torch.zeros((batch_size + 1, num_heads), dtype=torch.int32, device=device)
-    kv_indptr[1, :] = torch.cumsum(tokens_per_head, dim=0)  # 累积和
+    # 使用 cumsum 生成每个 head 的起止位置
+    cumsum = torch.cumsum(tokens_per_head, dim=0)  # [num_heads]
+    kv_indptr[0, 1:] = cumsum[:-1]  # 每个 head 的起始位置（除了第一个）
+    kv_indptr[0, 0] = 0  # 第一个 head 从 0 开始
+    kv_indptr[1, :] = cumsum  # 每个 head 的结束位置
     
     # 3. 批量生成所有 token indices（关键优化）
     # 使用 repeat_interleave 避免循环
