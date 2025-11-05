@@ -938,14 +938,13 @@ class QuestTokenToKVPool(KVCache):
     核心组成：
     - k_buffer/v_buffer: 标准 KV cache [size + page_size, head_num, head_dim]
     - k_metadata: page-level 元数据 [num_pages, head_num, head_dim, 2]
-      - [..., 0]: 该 page 内所有 K 向量的 min 值
-      - [..., 1]: 该 page 内所有 K 向量的 max 值
-    - metadata_initialized: 标记哪些 page 的元数据已初始化 [num_pages, head_num]
+      - [..., 0]: 该 page 内所有 K 向量的 min 值（初始化为 +inf）
+      - [..., 1]: 该 page 内所有 K 向量的 max 值（初始化为 -inf）
     
     设计原理：
-    - Prefill 阶段：只写 KV cache，不计算元数据
-    - Decode 第一步：懒初始化 - 从 KV cache 回读计算所有 prefill pages 的 min/max
-    - Decode 后续步：增量更新当前 page 的 min/max
+    - 元数据初始化为 inf（+inf for min, -inf for max）
+    - Prefill/Extend 阶段：写入 KV cache 后立即计算元数据
+    - Decode 阶段：增量更新当前 page 的 min/max
     """
     
     def __init__(
@@ -1013,16 +1012,10 @@ class QuestTokenToKVPool(KVCache):
                 for _ in range(layer_num)
             ]
             
-            # 初始化元数据为极值（标记未初始化）
+            # 初始化元数据为极值（首次更新时会自动处理）
             for meta in self.k_metadata:
                 meta[..., 0].fill_(self.pos_inf)  # min 初始化为 +inf
                 meta[..., 1].fill_(self.neg_inf)  # max 初始化为 -inf
-        
-        # 初始化标记（用于判断 page 是否已计算过元数据）
-        self.metadata_initialized = [
-            torch.zeros((num_pages, head_num), dtype=torch.bool, device=device)
-            for _ in range(layer_num)
-        ]
         
         logger.info(
             f"Quest KV Cache allocated: {size} tokens, {num_pages} pages, "
@@ -1045,10 +1038,6 @@ class QuestTokenToKVPool(KVCache):
     def get_metadata_buffer(self, layer_id: int):
         """获取元数据 buffer: [num_pages, head_num, head_dim, 2]"""
         return self.k_metadata[layer_id - self.start_layer]
-    
-    def get_metadata_init_flag(self, layer_id: int):
-        """获取初始化标记: [num_pages, head_num]"""
-        return self.metadata_initialized[layer_id - self.start_layer]
     
     def set_kv_buffer(
         self,
