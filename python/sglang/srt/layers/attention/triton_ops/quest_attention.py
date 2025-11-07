@@ -81,8 +81,10 @@ def _quest_decode_kernel_stage1(
     # kv_indptr: [batch+1]
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     
-    # 当前 head 在 kv_indices 中的起始偏移
-    cur_batch_kv_start_idx = cur_head * cur_batch_seq_len
+    # 当前 batch 在 kv_indices 中的起始偏移（按每个 batch 的 token 数乘以 head 数）
+    # 注意：kv_indptr 单位是“每 head 的 token 数”，因此需要乘以 head_num 才能得到跨 head 的总偏移
+    cur_batch_base_tokens = tl.load(kv_indptr + cur_batch)
+    cur_batch_kv_start_idx = cur_head * cur_batch_seq_len + cur_batch_base_tokens * head_num
     
     kv_splits = tl.load(num_kv_splits + cur_batch)
     
@@ -632,141 +634,258 @@ def quest_estimate_scores(
         print("="*80 + "\n")
 
 
+@triton.jit
+def quest_select_topk_kernel(
+    estimated_scores_ptr,
+    seq_lens_ptr,
+    selected_pages_ptr,
+    stride_sb,
+    stride_sh,
+    stride_sel_b,
+    stride_sel_h,
+    page_size: tl.constexpr,
+    quest_topk: tl.constexpr,
+    max_pages: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,      # next power-of-2 of max_pages
+    BLOCK_SLOTS: tl.constexpr,      # next power-of-2 of (quest_topk+1)
+    num_heads: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    batch_idx = program_id // num_heads
+    head_idx = program_id % num_heads
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    num_pages = (seq_len + page_size - 1) // page_size
+    valid_pages = tl.maximum(num_pages - 1, 0)
+
+    scores_base = estimated_scores_ptr + batch_idx * stride_sb + head_idx * stride_sh
+    offs = tl.arange(0, BLOCK_PAGES)
+    scores = tl.load(scores_base + offs, mask=offs < max_pages, other=-float("inf"))
+    scores = tl.where(offs < valid_pages, scores, -float("inf"))
+
+    selected_base = selected_pages_ptr + batch_idx * stride_sel_b + head_idx * stride_sel_h
+    idx_slots = tl.arange(0, BLOCK_SLOTS)
+    tl.store(
+        selected_base + idx_slots, tl.full([BLOCK_SLOTS], -1, dtype=tl.int32), mask=idx_slots < (quest_topk + 1)
+    )
+
+    if valid_pages <= quest_topk:
+        rng = tl.arange(0, BLOCK_SLOTS)
+        sequential = tl.where(rng < valid_pages, rng, -1)
+        tl.store(selected_base + rng, sequential, mask=rng < quest_topk)
+    else:
+        for i in range(quest_topk):
+            max_idx = tl.argmax(scores, axis=0)
+            tl.store(selected_base + i, max_idx.to(tl.int32))
+            scores = tl.where(offs == max_idx, -float("inf"), scores)
+
+    last_page = tl.where(num_pages > 0, num_pages - 1, 0)
+    tl.store(selected_base + quest_topk, last_page.to(tl.int32))
+
+
+@triton.jit
+def quest_expand_pages_to_csr_kernel(
+    selected_pages_ptr,         # [bsz, num_heads, quest_topk+1]
+    seq_lens_ptr,               # [bsz]
+    req_to_token_ptr,           # [bsz, max_seq_len]
+    kv_indices_ptr,             # output [bsz * num_heads, tokens_cap]
+    tokens_per_head_ptr,        # output [bsz * num_heads]
+    stride_sel_b,               # 340
+    stride_sel_h,               # 17
+    stride_rt_b: tl.constexpr,  # 32772
+    stride_rt_pos: tl.constexpr,# 1
+    tokens_cap: tl.constexpr,   # 272
+    BLOCK_TOKENS: tl.constexpr, # 512
+    stride_idx_h: tl.constexpr, # 1
+    page_size: tl.constexpr,    # 16
+    quest_topk: tl.constexpr,   # 16
+    num_heads: tl.constexpr,    # 20
+):
+    program_id = tl.program_id(0)  # 0
+    batch_idx = program_id // num_heads  # 0
+    head_idx = program_id % num_heads  # 0
+
+    # Ensure scalar math stays in int32
+    seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int32)  # 501
+    ps = tl.full((), page_size, dtype=tl.int32)  # 16
+    one = tl.full((), 1, dtype=tl.int32)  # 1
+    num_pages = (seq_len + ps - one) // ps  # (501+16-1)//16=32
+
+    selected_base = selected_pages_ptr + batch_idx * stride_sel_b + head_idx * stride_sel_h  # ptr + 0 * 340 + 0 * 17 = ptr + 0
+    indices_base = kv_indices_ptr + (batch_idx * num_heads + head_idx) * stride_idx_h  # ptr + (0*20+0)*1 = ptr + 0
+
+    offsets_cap = tl.arange(0, BLOCK_TOKENS)  # [0, 1, 2, ..., 511]
+    tl.store(
+        indices_base + offsets_cap,
+        tl.full([BLOCK_TOKENS], 0, dtype=tl.int32),
+        mask=offsets_cap < tokens_cap,
+    )  # kv_indices initialize to 0
+
+    write_offset = tl.zeros((), dtype=tl.int32)  # 0
+    token_offsets = tl.arange(0, page_size)  # [0, 1, 2, ..., 15]
+
+    for i in range(quest_topk + 1):
+        page = tl.load(selected_base + i).to(tl.int32)  # 12 (, 13, 11, 19)
+        is_valid_page = (page >= 0) & (page < num_pages)
+        start = tl.where(is_valid_page, page * ps, tl.zeros((), dtype=tl.int32))  # 12 * 16 = 192
+        end = tl.minimum(start + ps, seq_len)  # min(192+16, 501)=208
+        length = tl.where(is_valid_page, end - start, tl.zeros((), dtype=tl.int32))  # 16
+
+        # compute per-lane offsets and robust mask to ensure in-bounds
+        lane_offsets = write_offset + token_offsets  # [0, 1, 2, ..., 15]
+        mask_token = token_offsets < length  # [T,T,T,...,T] length=16
+        mask_ptr = mask_token & (lane_offsets < tokens_cap)
+        # map logical position to physical token id via req_to_token
+        logical_pos = start + token_offsets  # [192, 193, 194, ..., 207]
+        phys_ids = tl.load(
+            req_to_token_ptr + batch_idx * stride_rt_b + logical_pos * stride_rt_pos,  # ptr + 0 * 32772 + logical_pos * 1
+            mask=mask_token,
+            other=0,
+        )
+        tl.store(indices_base + lane_offsets, phys_ids, mask=mask_ptr)
+
+        # no debug writes
+
+        write_offset += length
+
+    tl.store(tokens_per_head_ptr + program_id, write_offset)
+
+
+@triton.jit
+def quest_pack_kv_indices_kernel(
+    kv_indices_src_ptr,        # [bs*H, tokens_cap]
+    kv_indices_dst_ptr,        # [sum_b L_b * H]
+    kv_indptr_ptr,             # [bs+1]
+    tokens_per_batch_ptr,      # [bs]
+    stride_src_h: tl.constexpr,
+    tokens_cap: tl.constexpr,
+    num_heads: tl.constexpr,
+    BLOCK_COPY: tl.constexpr,
+    ITERS: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+
+    Lb = tl.load(tokens_per_batch_ptr + bid).to(tl.int32)
+    if Lb == 0:
+        return
+
+    # src row = (bid * H + hid)
+    src_row = bid * num_heads + hid
+    src_base = kv_indices_src_ptr + src_row * stride_src_h
+
+    # dst base offset = (kv_indptr[bid] * H) + hid * Lb
+    base_tokens_before = tl.load(kv_indptr_ptr + bid).to(tl.int32)
+    dst_offset_base = base_tokens_before * num_heads + hid * Lb
+    dst_base = kv_indices_dst_ptr + dst_offset_base
+
+    offs = tl.arange(0, BLOCK_COPY)
+    # copy in fixed number of chunks; guard with masks
+    for it in range(ITERS):
+        start = tl.full((), it * BLOCK_COPY, dtype=tl.int32)
+        # source bounds: start + offs < tokens_cap
+        src_mask = (start + offs) < tokens_cap
+        # dest bounds: start + offs < Lb
+        dst_mask = (start + offs) < Lb
+        mask = src_mask & dst_mask
+        vals = tl.load(src_base + start + offs, mask=mask, other=0)
+        tl.store(dst_base + start + offs, vals, mask=mask)
+
+
 def quest_select_topk_pages(
     estimated_scores: torch.Tensor,     # [batch, num_heads, max_pages]
     seq_lens: torch.Tensor,             # [batch]
+    req_to_token: torch.Tensor,         # [batch, max_context_len]
     quest_topk: int,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    TopK Selection: 选择得分最高的 K 个 pages + last page
-    
-    返回 CSR 格式的索引（简化版，所有 head 选中数量相同）：
-    - kv_indptr: [batch + 1]  # 每个 batch 的 token 数量（每个 head 相同）
-    - kv_indices: [total_selected_tokens]  # 所有 batch 和 head 的 token indices 拼接
-    
-    核心逻辑：
-    1. 对每个 (batch, head)，在前 num_pages-1 个 pages 中选 TopK
-    2. 强制追加 last_page_idx
-    3. 展开 pages 为 token indices
-    4. 转换为 CSR 格式（所有 head 共享相同的 token 数量）
-    5. 支持 batch size > 1，通过 padding 最小值来处理不同的 seqlen
-    """
+    """使用 Triton kernel 选择 Quest page 并展开为 CSR 索引。"""
     batch_size, num_heads, max_pages = estimated_scores.shape
     device = estimated_scores.device
-    
+
     assert quest_topk > 0, "quest_topk must be greater than 0"
-    
-    # 计算每个 batch 的 num_pages 和 last_page
-    # seq_lens: [batch]
-    num_pages_per_batch = (seq_lens + page_size - 1) // page_size  # [batch]
-    last_pages = num_pages_per_batch - 1  # [batch]
-    
-    # 为 topk 创建 mask，将无效 pages（超过实际 num_pages-1 的部分）设置为 -inf
-    # estimated_scores: [batch, num_heads, max_pages]
-    # 对于每个 batch，只有前 num_pages-1 个是有效的（排除 last page）
-    nvtx.range_push("create mask for padding")
-    page_indices = torch.arange(max_pages, device=device).unsqueeze(0)  # [1, max_pages]
-    # valid_mask[b, p] = (p < num_pages_per_batch[b] - 1)
-    valid_mask = page_indices < (num_pages_per_batch - 1).unsqueeze(-1)  # [batch, max_pages]
-    valid_mask = valid_mask.unsqueeze(1)  # [batch, 1, max_pages] 扩展到 head 维度
-    
-    # 将无效位置的分数设置为 -inf，这样 topk 就不会选中它们
-    scores_for_topk = estimated_scores.clone()  # [batch, num_heads, max_pages]
-    scores_for_topk = torch.where(valid_mask, scores_for_topk, torch.tensor(float('-inf'), device=device))
-    nvtx.range_pop()
-    
-    # 对于每个 batch，判断是否需要稀疏化
-    # 如果 num_pages <= quest_topk + 1，则退化为稠密
-    need_sparse = num_pages_per_batch > (quest_topk + 1)  # [batch]
-    
-    # 计算每个 batch 实际选择的 k（对于稠密情况，k = num_pages - 1）
-    # k_per_batch[b] = min(quest_topk, num_pages_per_batch[b] - 1) if need_sparse[b] else num_pages_per_batch[b] - 1
-    k_per_batch = torch.where(
-        need_sparse,
-        torch.minimum(torch.tensor(quest_topk, device=device), num_pages_per_batch - 1),
-        num_pages_per_batch - 1
-    )  # [batch]
-    
-    # 统一使用最大的 k 值来进行 topk 操作（方便批处理）
-    max_k = k_per_batch.max().item()
-    max_k = max(max_k, 1)  # 至少为 1
-    
-    # 对所有 batch 执行 topk（使用统一的 k）
-    # scores_for_topk: [batch, num_heads, max_pages]
-    nvtx.range_push("topk")
-    topk_result = torch.topk(scores_for_topk, k=max_k, dim=-1)
-    topk_pages = topk_result.indices  # [batch, num_heads, max_k]
-    nvtx.range_pop()
-    
-    # 对于每个 batch，只保留前 k_per_batch[b] 个结果
-    # 为了向量化，我们创建一个 mask
-    nvtx.range_push("mask topk results")
-    k_indices = torch.arange(max_k, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, max_k]
-    topk_mask = k_indices < k_per_batch.unsqueeze(-1).unsqueeze(-1)  # [batch, 1, max_k]
-    # 将超出 k_per_batch 的位置设置为 -1（稍后过滤）
-    topk_pages = torch.where(topk_mask, topk_pages, torch.tensor(-1, dtype=torch.int32, device=device))
-    nvtx.range_pop()
-    
-    # 追加 last page
-    nvtx.range_push("append last page")
-    last_page_tensor = last_pages.unsqueeze(-1).unsqueeze(-1).expand(batch_size, num_heads, 1)  # [batch, num_heads, 1]
-    selected_pages = torch.cat([topk_pages, last_page_tensor], dim=-1)  # [batch, num_heads, max_k+1]
-    nvtx.range_pop()
-    
-    # 展开 pages 为 token indices，构建 CSR 格式
-    # selected_pages: [batch, num_heads, max_k+1]
-    
-    # 1. 计算每个 page 的起始 token 和有效 token 数量（全向量化）
-    nvtx.range_push("calculate page starts and ends")
-    page_starts = selected_pages * page_size  # [batch, num_heads, max_k+1]
-    # 需要对每个 batch 使用其对应的 seq_len
-    seq_lens_expanded = seq_lens.unsqueeze(-1).unsqueeze(-1)  # [batch, 1, 1]
-    page_ends = torch.clamp(page_starts + page_size, max=seq_lens_expanded)  # [batch, num_heads, max_k+1]
-    page_lens = page_ends - page_starts  # [batch, num_heads, max_k+1]
-    
-    # 对于 selected_pages == -1 的位置（被 mask 掉的），page_lens 应该为 0
-    page_lens = torch.where(selected_pages >= 0, page_lens, torch.tensor(0, dtype=torch.int32, device=device))
-    nvtx.range_pop()
 
-    nvtx.range_push("calculate tokens count")
-    # 2. 计算 kv_indptr（每个 batch 的 token 数量）
-    # 对于每个 batch，所有 head 选中的 token 数量应该相同
-    tokens_per_head = page_lens.sum(dim=-1)  # [batch, num_heads]
-    # 验证每个 batch 内所有 head 的 token 数量相同
-    # assert (tokens_per_head.max(dim=1)[0] == tokens_per_head.min(dim=1)[0]).all(), "All heads should have the same number of tokens within each batch"
-    tokens_per_batch = tokens_per_head[:, 0]  # [batch]
-    
-    # 构建 kv_indptr: [batch+1]
+    selected_pages = torch.empty(
+        (batch_size, num_heads, quest_topk + 1), dtype=torch.int32, device=device
+    )
+
+    # Round sizes up to power-of-two for tl.arange
+    BLOCK_PAGES = triton.next_power_of_2(max_pages)
+    BLOCK_SLOTS = triton.next_power_of_2(quest_topk + 1)
+
+    grid = (batch_size * num_heads,)
+    quest_select_topk_kernel[grid](
+        estimated_scores,
+        seq_lens,
+        selected_pages,
+        estimated_scores.stride(0),
+        estimated_scores.stride(1),
+        selected_pages.stride(0),
+        selected_pages.stride(1),
+        page_size=page_size,
+        quest_topk=quest_topk,
+        max_pages=max_pages,
+        BLOCK_PAGES=BLOCK_PAGES,
+        BLOCK_SLOTS=BLOCK_SLOTS,
+        num_heads=num_heads,
+    )
+
+    tokens_cap = (quest_topk + 1) * page_size
+    BLOCK_TOKENS = triton.next_power_of_2(tokens_cap)
+    kv_indices_buf = torch.empty(
+        (batch_size * num_heads, tokens_cap), dtype=torch.int32, device=device
+    )
+    tokens_per_head = torch.zeros(
+        (batch_size * num_heads,), dtype=torch.int32, device=device
+    )
+
+    quest_expand_pages_to_csr_kernel[grid](
+        selected_pages,
+        seq_lens,
+        req_to_token,
+        kv_indices_buf,
+        tokens_per_head,
+        selected_pages.stride(0),
+        selected_pages.stride(1),
+        stride_rt_b=req_to_token.stride(0),
+        stride_rt_pos=req_to_token.stride(1),
+        tokens_cap=tokens_cap,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+        stride_idx_h=kv_indices_buf.stride(0),
+        page_size=page_size,
+        quest_topk=quest_topk,
+        num_heads=num_heads,
+    )
+
+    tokens_per_head = tokens_per_head.view(batch_size, num_heads)
+    # 为满足 decode 内核“各 head 相同长度”的约束，取各 head 的最小值作为本 batch 的有效长度
+    tokens_per_batch = torch.min(tokens_per_head, dim=1).values.contiguous()
+
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indptr[1:] = torch.cumsum(tokens_per_batch, dim=0)
-    nvtx.range_pop()
+    torch.cumsum(tokens_per_batch, dim=0, out=kv_indptr[1:])
 
-    # 3. 批量生成所有 token indices（关键优化）
-    nvtx.range_push("generate token indices")
-    max_page_len = page_lens.max().item()
+    kv_indices_buf = kv_indices_buf.view(batch_size, num_heads, tokens_cap)
+    total_tokens_per_head = kv_indptr[-1].item()
+    total_tokens_all_heads = total_tokens_per_head * num_heads
+    kv_indices = torch.empty((total_tokens_all_heads,), dtype=torch.int32, device=device)
 
-    if max_page_len > 0:
-        # 生成基础 offsets: [0, 1, 2, ..., max_page_len-1]
-        offsets = torch.arange(max_page_len, dtype=torch.int32, device=device)  # [max_page_len]
-        
-        # 广播生成所有 (batch, head, page) 的 tokens: [batch, num_heads, max_k+1, max_page_len]
-        page_starts_expanded = page_starts.unsqueeze(-1)  # [batch, num_heads, max_k+1, 1]
-        page_lens_expanded = page_lens.unsqueeze(-1)  # [batch, num_heads, max_k+1, 1]
-        offsets_expanded = offsets.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, max_page_len]
-        
-        # tokens[b, h, p, t] = page_starts[b, h, p] + t
-        all_tokens = page_starts_expanded + offsets_expanded  # [batch, num_heads, max_k+1, max_page_len]
-        
-        # mask: 只保留有效 tokens (t < page_lens[b, h, p])
-        mask = offsets_expanded < page_lens_expanded  # [batch, num_heads, max_k+1, max_page_len]
-        
-        # 展平并过滤（保持 batch, head 顺序）
-        kv_indices = all_tokens[mask]  # [total_tokens]
-    else:
-        # 空序列
-        kv_indices = torch.empty(0, dtype=torch.int32, device=device)
-    nvtx.range_pop()
+    # pack into tightly-packed layout expected by decode kernel
+    BLOCK_COPY = triton.next_power_of_2(tokens_cap)
+    ITERS = (tokens_cap + BLOCK_COPY - 1) // BLOCK_COPY
+    src_2d = kv_indices_buf.reshape(-1, tokens_cap)
+    quest_pack_kv_indices_kernel[(batch_size, num_heads)](
+        src_2d,
+        kv_indices,
+        kv_indptr,
+        tokens_per_batch,
+        src_2d.stride(0),
+        tokens_cap,
+        num_heads,
+        BLOCK_COPY,
+        ITERS,
+    )
+
+    # no debug printing
 
     return kv_indptr, kv_indices
 
