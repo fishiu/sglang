@@ -331,7 +331,7 @@ def quest_decode_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
-        MIN_BLOCK_KV=16,
+        MIN_BLOCK_KV=32,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=2,
@@ -644,10 +644,10 @@ def quest_select_topk_kernel(
     stride_sel_b,
     stride_sel_h,
     page_size: tl.constexpr,
-    quest_topk: tl.constexpr,
+    quest_topk: tl.constexpr,       # total selected pages including last page
     max_pages: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,      # next power-of-2 of max_pages
-    BLOCK_SLOTS: tl.constexpr,      # next power-of-2 of (quest_topk+1)
+    BLOCK_SLOTS: tl.constexpr,      # next power-of-2 of quest_topk
     num_heads: tl.constexpr,
 ):
     program_id = tl.program_id(0)
@@ -665,27 +665,30 @@ def quest_select_topk_kernel(
 
     selected_base = selected_pages_ptr + batch_idx * stride_sel_b + head_idx * stride_sel_h
     idx_slots = tl.arange(0, BLOCK_SLOTS)
+    # initialize to -1 for all quest_topk slots
     tl.store(
-        selected_base + idx_slots, tl.full([BLOCK_SLOTS], -1, dtype=tl.int32), mask=idx_slots < (quest_topk + 1)
+        selected_base + idx_slots, tl.full([BLOCK_SLOTS], -1, dtype=tl.int32), mask=idx_slots < quest_topk
     )
 
-    if valid_pages <= quest_topk:
+    # pick top-(quest_topk-1) pages excluding last page; the last slot is reserved for last page
+    if valid_pages <= (quest_topk - 1):
         rng = tl.arange(0, BLOCK_SLOTS)
         sequential = tl.where(rng < valid_pages, rng, -1)
-        tl.store(selected_base + rng, sequential, mask=rng < quest_topk)
+        tl.store(selected_base + rng, sequential, mask=rng < (quest_topk - 1))
     else:
-        for i in range(quest_topk):
+        for i in range(quest_topk - 1):
             max_idx = tl.argmax(scores, axis=0)
             tl.store(selected_base + i, max_idx.to(tl.int32))
             scores = tl.where(offs == max_idx, -float("inf"), scores)
 
+    # append last page to the last slot
     last_page = tl.where(num_pages > 0, num_pages - 1, 0)
-    tl.store(selected_base + quest_topk, last_page.to(tl.int32))
+    tl.store(selected_base + (quest_topk - 1), last_page.to(tl.int32))
 
 
 @triton.jit
 def quest_expand_pages_to_csr_kernel(
-    selected_pages_ptr,         # [bsz, num_heads, quest_topk+1]
+    selected_pages_ptr,         # [bsz, num_heads, quest_topk]
     seq_lens_ptr,               # [bsz]
     req_to_token_ptr,           # [bsz, max_seq_len]
     kv_indices_ptr,             # output [bsz * num_heads, tokens_cap]
@@ -698,7 +701,7 @@ def quest_expand_pages_to_csr_kernel(
     BLOCK_TOKENS: tl.constexpr, # 512
     stride_idx_h: tl.constexpr, # 1
     page_size: tl.constexpr,    # 16
-    quest_topk: tl.constexpr,   # 16
+    quest_topk: tl.constexpr,   # total selected pages including last page
     num_heads: tl.constexpr,    # 20
 ):
     program_id = tl.program_id(0)  # 0
@@ -724,7 +727,8 @@ def quest_expand_pages_to_csr_kernel(
     write_offset = tl.zeros((), dtype=tl.int32)  # 0
     token_offsets = tl.arange(0, page_size)  # [0, 1, 2, ..., 15]
 
-    for i in range(quest_topk + 1):
+    # iterate over quest_topk slots (topk-1 + last)
+    for i in range(quest_topk):
         page = tl.load(selected_base + i).to(tl.int32)  # 12 (, 13, 11, 19)
         is_valid_page = (page >= 0) & (page < num_pages)
         start = tl.where(is_valid_page, page * ps, tl.zeros((), dtype=tl.int32))  # 12 * 16 = 192
@@ -799,19 +803,20 @@ def quest_select_topk_pages(
     quest_topk: int,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """使用 Triton kernel 选择 Quest page 并展开为 CSR 索引。"""
+    """选择 topk-1 个非末页并追加 last page，共 quest_topk 个页；展开为 CSR 索引。"""
     batch_size, num_heads, max_pages = estimated_scores.shape
     device = estimated_scores.device
 
     assert quest_topk > 0, "quest_topk must be greater than 0"
 
+    # Allocate slots for (topk-1) + last = quest_topk pages
     selected_pages = torch.empty(
-        (batch_size, num_heads, quest_topk + 1), dtype=torch.int32, device=device
+        (batch_size, num_heads, quest_topk), dtype=torch.int32, device=device
     )
 
     # Round sizes up to power-of-two for tl.arange
     BLOCK_PAGES = triton.next_power_of_2(max_pages)
-    BLOCK_SLOTS = triton.next_power_of_2(quest_topk + 1)
+    BLOCK_SLOTS = triton.next_power_of_2(quest_topk)
 
     grid = (batch_size * num_heads,)
     quest_select_topk_kernel[grid](
@@ -830,7 +835,7 @@ def quest_select_topk_pages(
         num_heads=num_heads,
     )
 
-    tokens_cap = (quest_topk + 1) * page_size
+    tokens_cap = quest_topk * page_size
     BLOCK_TOKENS = triton.next_power_of_2(tokens_cap)
     kv_indices_buf = torch.empty(
         (batch_size * num_heads, tokens_cap), dtype=torch.int32, device=device

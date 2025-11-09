@@ -424,7 +424,6 @@ class ModelRunner:
                 "Quest (Query-Aware Sparsity) is enabled. Use triton backend without CUDA graph."
             )
             server_args.attention_backend = "triton"
-            server_args.disable_cuda_graph = True
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
