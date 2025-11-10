@@ -51,6 +51,7 @@ class QuestAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.quest_attention import (
             quest_estimate_scores,
             quest_select_topk_pages,
+            quest_select_topk_pages_into,
             quest_update_kv_and_metadata,
             quest_compute_extend_metadata,
             quest_decode_attention_fwd,
@@ -59,6 +60,7 @@ class QuestAttnBackend(AttentionBackend):
         
         self.quest_estimate_scores = quest_estimate_scores
         self.quest_select_topk_pages = quest_select_topk_pages
+        self.quest_select_topk_pages_into = quest_select_topk_pages_into
         self.quest_update_kv_and_metadata = quest_update_kv_and_metadata
         self.quest_compute_extend_metadata = quest_compute_extend_metadata
         self.quest_decode_attention_fwd = quest_decode_attention_fwd
@@ -85,6 +87,7 @@ class QuestAttnBackend(AttentionBackend):
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.device = model_runner.device
+        self.max_context_len = model_runner.model_config.context_len
 
         # CUDA Graph related buffers (lazily initialized)
         self.cuda_graph_attn_logits: Optional[torch.Tensor] = None
@@ -92,6 +95,12 @@ class QuestAttnBackend(AttentionBackend):
         self.cuda_graph_num_kv_splits: Optional[torch.Tensor] = None
         self.cuda_graph_kv_indices: Optional[torch.Tensor] = None
         self.kv_indptr: Optional[torch.Tensor] = None
+        # Quest-specific graph scratch buffers (for in-graph update/estimate/select)
+        self.cuda_graph_estimated_scores: Optional[torch.Tensor] = None
+        self.cuda_graph_selected_pages: Optional[torch.Tensor] = None
+        self.cuda_graph_kv_indices_buf: Optional[torch.Tensor] = None
+        self.cuda_graph_tokens_per_head: Optional[torch.Tensor] = None
+        self.cuda_graph_tokens_per_batch: Optional[torch.Tensor] = None
         # Flag indicating graph kv buffers are populated for current capture/replay context
         self._graph_meta_ready: bool = False
     
@@ -163,6 +172,7 @@ class QuestAttnBackend(AttentionBackend):
                 extend_start_loc=forward_batch.extend_start_loc,
                 seq_lens=forward_batch.extend_seq_lens,
                 page_size=self.page_size,
+                max_pages_cap=(self.max_context_len + self.page_size - 1) // self.page_size,
             )
             nvtx.range_pop()
         
@@ -257,69 +267,71 @@ class QuestAttnBackend(AttentionBackend):
                 (forward_batch.batch_size,), self.max_kv_splits, dtype=torch.int32, device="cuda"
             )
         else:
+            # Graph path: compute update/estimate/select in-graph with static buffers
             kv_indptr = self.forward_metadata["kv_indptr"]
             kv_indices = self.forward_metadata["kv_indices"]
             attn_logits = self.forward_metadata["attn_logits"]
             attn_lse = self.forward_metadata["attn_lse"]
             num_kv_splits = self.forward_metadata["num_kv_splits"]
-            # Ensure we do NOT do any host sync or device value branching during capture
-            if not get_is_capture_mode() and not self._graph_meta_ready:
-                # Populate graph buffers during warmup or replay preparation path
-                if save_kv_cache:
-                    nvtx.range_push("quest_update_kv_and_metadata")
-                    self.quest_update_kv_and_metadata(
-                        k_new=k.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        v_new=v.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                        v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                        k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
-                        out_cache_loc=forward_batch.out_cache_loc,
-                        page_size=self.page_size,
-                    )
-                    nvtx.range_pop()
 
-                nvtx.range_push("quest_estimate_scores")
-                bs_now = forward_batch.batch_size
-                max_pages = (int(forward_batch.seq_lens.max().item()) + self.page_size - 1) // self.page_size
-                if self.estimated_scores is None or self.estimated_scores.shape[0] < bs_now or self.estimated_scores.shape[2] < max_pages:
-                    self.estimated_scores = torch.zeros(
-                        (bs_now, self.num_head, max_pages), dtype=torch.float32, device=self.device
-                    )
-                self.quest_estimate_scores(
-                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            # 1) Update KV and page metadata
+            if save_kv_cache:
+                nvtx.range_push("quest_update_kv_and_metadata")
+                self.quest_update_kv_and_metadata(
+                    k_new=k.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    v_new=v.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                     k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
-                    seq_lens=forward_batch.seq_lens,
-                    estimated_scores=self.estimated_scores,
-                    page_size=self.page_size,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices
-                    ],
-                )
-                nvtx.range_pop()
-
-                nvtx.range_push("quest_select_topk_pages")
-                kv_indptr_tmp, kv_indices_tmp = self.quest_select_topk_pages(
-                    estimated_scores=self.estimated_scores,
-                    seq_lens=forward_batch.seq_lens,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices
-                    ],
-                    quest_topk=self.quest_topk,
+                    out_cache_loc=forward_batch.out_cache_loc,
                     page_size=self.page_size,
                 )
                 nvtx.range_pop()
 
-                kv_indptr[: forward_batch.batch_size + 1].copy_(kv_indptr_tmp)
-                # Avoid .item() in capture; this is outside capture
-                total_tokens_per_head = int(kv_indptr_tmp[-1].item())
-                total_tokens_all_heads = total_tokens_per_head * self.num_head
-                if total_tokens_all_heads > 0:
-                    kv_indices[:total_tokens_all_heads].copy_(kv_indices_tmp)
-                self.triton_backend.get_num_kv_splits(
-                    num_kv_splits[: forward_batch.batch_size],
-                    kv_indptr_tmp[1:] - kv_indptr_tmp[:-1],
-                )
-                self._graph_meta_ready = True
+            # 2) Estimate page scores into preallocated buffer (static max_pages capacity)
+            nvtx.range_push("quest_estimate_scores")
+            # Use a tighter static cap for pages to reduce overlaunch inside graph
+            pages_cap = getattr(self, "_cg_estimate_pages", None)
+            if pages_cap is None:
+                pages_cap = (self.max_context_len + self.page_size - 1) // self.page_size
+            est_view = self.cuda_graph_estimated_scores[
+                : forward_batch.batch_size, :, : pages_cap
+            ]
+            self.quest_estimate_scores(
+                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
+                seq_lens=forward_batch.seq_lens,
+                estimated_scores=est_view,
+                page_size=self.page_size,
+                req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices
+                ],
+            )
+            nvtx.range_pop()
+
+            # 3) Select+Expand+Pack into graph kv buffers (no allocations)
+            nvtx.range_push("quest_select_expand_pack")
+            bs_now = forward_batch.batch_size
+            kv_indptr.zero_()
+            self.quest_select_topk_pages_into(
+                estimated_scores=est_view,
+                seq_lens=forward_batch.seq_lens,
+                req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices
+                ],
+                quest_topk=self.quest_topk,
+                page_size=self.page_size,
+                selected_pages=self.cuda_graph_selected_pages[:bs_now],
+                kv_indices_buf=self.cuda_graph_kv_indices_buf[: bs_now * self.num_head],
+                tokens_per_head=self.cuda_graph_tokens_per_head[: bs_now * self.num_head],
+                tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
+                kv_indptr=kv_indptr[: bs_now + 1],
+                kv_indices=kv_indices,
+                num_heads=self.num_head,
+            )
+            if num_kv_splits is not None:
+                num_kv_splits[:bs_now].fill_(self.max_kv_splits)
+            nvtx.range_pop()
         
         # Step 4: Sparse Attention - 对选中 pages 做完整 attention
         # 使用 Quest 专用的 decode kernel（支持 per-head kv_indptr）
@@ -363,8 +375,8 @@ class QuestAttnBackend(AttentionBackend):
             (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
 
-        # kv indices capacity: (K + 1) pages per head
-        tokens_per_head_upper = (self.quest_topk + 1) * self.page_size
+        # kv indices capacity: quest_topk pages per head (topk-1 + last)
+        tokens_per_head_upper = (self.quest_topk) * self.page_size
         total_capacity = max_num_tokens * self.num_head * tokens_per_head_upper
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
@@ -375,6 +387,24 @@ class QuestAttnBackend(AttentionBackend):
 
         # csr indptr for batches
         self.kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=self.device)
+
+        # Quest-specific scratch for estimate/select/expand without allocations (graph friendly)
+        max_pages_cap = (self.max_context_len + self.page_size - 1) // self.page_size
+        self.cuda_graph_estimated_scores = torch.zeros(
+            (max_bs, self.num_head, max_pages_cap), dtype=torch.float32, device=self.device
+        )
+        self.cuda_graph_selected_pages = torch.empty(
+            (max_bs, self.num_head, self.quest_topk), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_kv_indices_buf = torch.empty(
+            (max_bs * self.num_head, tokens_per_head_upper), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_tokens_per_head = torch.zeros(
+            (max_bs * self.num_head,), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_tokens_per_batch = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
         self._graph_meta_ready = False
 
     def init_forward_metadata_capture_cuda_graph(
@@ -398,6 +428,14 @@ class QuestAttnBackend(AttentionBackend):
             "attn_lse": self.cuda_graph_attn_lse,
             "num_kv_splits": self.cuda_graph_num_kv_splits[:bs],
         }
+        # Precompute a tighter pages cap for estimate to reduce overlaunch in graph
+        try:
+            max_pages_cap = (int(seq_lens[:bs].max().item()) + self.page_size - 1) // self.page_size
+            global_cap = (self.max_context_len + self.page_size - 1) // self.page_size
+            self._cg_estimate_pages = min(max_pages_cap, global_cap)
+        except Exception:
+            # Fallback to global cap
+            self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self._graph_meta_ready = False
 
     def init_forward_metadata_replay_cuda_graph(
@@ -421,8 +459,9 @@ class QuestAttnBackend(AttentionBackend):
             "attn_lse": self.cuda_graph_attn_lse,
             "num_kv_splits": self.cuda_graph_num_kv_splits[:bs],
         }
+        if not hasattr(self, "_cg_estimate_pages") or self._cg_estimate_pages is None:
+            self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self._graph_meta_ready = False
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
-

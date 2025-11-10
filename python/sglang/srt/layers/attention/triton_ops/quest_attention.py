@@ -967,6 +967,106 @@ def quest_update_metadata_kernel(
     )
 
 
+@triton.jit
+def quest_min_tokens_per_batch_kernel(
+    tokens_per_head_ptr,   # [bs * num_heads]
+    tokens_per_batch_ptr,  # [bs]
+    num_heads: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    # sequentially reduce across heads (num_heads is small and constexpr)
+    min_val = tl.full((), 0x7FFFFFFF, dtype=tl.int32)
+    for h in range(num_heads):
+        v = tl.load(tokens_per_head_ptr + bid * num_heads + h)
+        min_val = tl.minimum(min_val, v)
+    tl.store(tokens_per_batch_ptr + bid, min_val)
+
+
+def quest_select_topk_pages_into(
+    estimated_scores: torch.Tensor,     # [bs, num_heads, max_pages_cap]
+    seq_lens: torch.Tensor,             # [bs]
+    req_to_token: torch.Tensor,         # [bs, max_context_len]
+    quest_topk: int,
+    page_size: int,
+    selected_pages: torch.Tensor,       # prealloc [bs, num_heads, quest_topk]
+    kv_indices_buf: torch.Tensor,       # prealloc [(bs*num_heads), tokens_cap]
+    tokens_per_head: torch.Tensor,      # prealloc [(bs*num_heads)]
+    tokens_per_batch: torch.Tensor,     # prealloc [bs]
+    kv_indptr: torch.Tensor,            # prealloc [bs+1]
+    kv_indices: torch.Tensor,           # prealloc big 1D buffer
+    num_heads: int,
+):
+    device = estimated_scores.device
+    bs = estimated_scores.shape[0]
+    max_pages = estimated_scores.shape[-1]
+    tokens_cap = quest_topk * page_size
+
+    # 1) select top-(k-1) + append last, into selected_pages
+    BLOCK_PAGES = triton.next_power_of_2(max_pages)
+    BLOCK_SLOTS = triton.next_power_of_2(quest_topk)
+    grid_sel = (bs * num_heads,)
+    quest_select_topk_kernel[grid_sel](
+        estimated_scores,
+        seq_lens,
+        selected_pages,
+        estimated_scores.stride(0),
+        estimated_scores.stride(1),
+        selected_pages.stride(0),
+        selected_pages.stride(1),
+        page_size=page_size,
+        quest_topk=quest_topk,
+        max_pages=max_pages,
+        BLOCK_PAGES=BLOCK_PAGES,
+        BLOCK_SLOTS=BLOCK_SLOTS,
+        num_heads=num_heads,
+    )
+
+    # 2) expand pages to tokens (per head) + count tokens per head
+    BLOCK_TOKENS = triton.next_power_of_2(tokens_cap)
+    quest_expand_pages_to_csr_kernel[grid_sel](
+        selected_pages,
+        seq_lens,
+        req_to_token,
+        kv_indices_buf,
+        tokens_per_head,
+        selected_pages.stride(0),
+        selected_pages.stride(1),
+        stride_rt_b=req_to_token.stride(0),
+        stride_rt_pos=req_to_token.stride(1),
+        tokens_cap=tokens_cap,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+        stride_idx_h=kv_indices_buf.stride(0),
+        page_size=page_size,
+        quest_topk=quest_topk,
+        num_heads=num_heads,
+    )
+
+    # 3) min across heads -> per-batch token count
+    if bs > 0:
+        quest_min_tokens_per_batch_kernel[(bs,)](
+            tokens_per_head,
+            tokens_per_batch,
+            num_heads=num_heads,
+        )
+    # kv_indptr[0] expected to be set by caller; compute cumsum into kv_indptr[1:]
+    torch.cumsum(tokens_per_batch, dim=0, out=kv_indptr[1:])
+
+    # 4) pack into tightly-packed 1D indices layout expected by decode kernel
+    src_2d = kv_indices_buf.view(bs, num_heads, tokens_cap).reshape(-1, tokens_cap)
+    BLOCK_COPY = triton.next_power_of_2(tokens_cap)
+    ITERS = (tokens_cap + BLOCK_COPY - 1) // BLOCK_COPY
+    quest_pack_kv_indices_kernel[(bs, num_heads)](
+        src_2d,
+        kv_indices,
+        kv_indptr,
+        tokens_per_batch,
+        src_2d.stride(0),
+        tokens_cap,
+        num_heads,
+        BLOCK_COPY,
+        ITERS,
+    )
+
 def quest_update_kv_and_metadata(
     k_new: torch.Tensor,                # [batch, num_heads, head_dim]
     v_new: torch.Tensor,                # [batch, num_heads, head_dim]
@@ -1120,6 +1220,7 @@ def quest_compute_extend_metadata(
     extend_start_loc: torch.Tensor,    # [batch+1]
     seq_lens: torch.Tensor,            # [batch]
     page_size: int,
+    max_pages_cap: int | None = None,
 ):
     """
     计算 extend 阶段的 page 元数据（min/max）
@@ -1135,10 +1236,13 @@ def quest_compute_extend_metadata(
     if batch_size == 0:
         return
     
-    nvtx.range_push("max pages")
-    # 计算最大的 page 数量
-    max_pages = ((seq_lens.max().item() + page_size - 1) // page_size)
-    nvtx.range_pop()
+    # 计算最大的 page 数量（避免 .item() 引起的 host 同步，允许外部传入上限）
+    if max_pages_cap is None:
+        nvtx.range_push("max pages (host-sync)")
+        max_pages = ((seq_lens.max().item() + page_size - 1) // page_size)
+        nvtx.range_pop()
+    else:
+        max_pages = int(max_pages_cap)
     
     nvtx.range_push("block dmodel")
     BLOCK_DMODEL = triton.next_power_of_2(head_dim)
