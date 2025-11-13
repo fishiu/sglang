@@ -12,6 +12,7 @@ Quest Attention Triton Kernels
 - 懒初始化：decode 第一步从 KV cache 回读计算元数据
 """
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -469,14 +470,105 @@ def quest_estimate_kernel(
     )
 
 
+@triton.jit
+def quest_estimate_split_kernel(
+    Q,                      # [batch, num_heads, head_dim]
+    K_metadata,             # [num_pages, num_heads, head_dim, 2]
+    Seq_lens,               # [batch]
+    Estimated_scores,       # 输出: [batch, num_heads, max_pages]
+    Req_to_token,           # [batch, max_context_len]
+    page_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_mp,
+    stride_mh,
+    stride_md,
+    stride_sb,
+    stride_sh,
+    stride_rb,
+    BLOCK_DMODEL: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
+):
+    """
+    Estimate（split 版本）：将原先按 page 维展开的网格，改为固定的 splits 维度。
+
+    网格：grid = (batch, num_heads, NUM_SPLITS)
+    - 每个 split 负责一段 page 区间：[split_start, split_end)
+    - 仅计算非 last page（保持与旧逻辑一致）
+
+    张量形状：
+    - Q:                [B, H, D]
+    - K_metadata:       [num_pages_global, H, D, 2]
+    - Seq_lens:         [B]
+    - Estimated_scores: [B, H, max_pages]
+    - Req_to_token:     [B, max_context_len]
+    """
+    bid = tl.program_id(0)  # batch index
+    hid = tl.program_id(1)  # head index
+    sid = tl.program_id(2)  # split index
+
+    # 当前 batch 的页数（向上取整）
+    seq_len = tl.load(Seq_lens + bid)
+    num_pages = (seq_len + page_size - 1) // page_size
+    valid_pages = tl.maximum(num_pages - 1, 0)  # 排除 last page
+
+    # 计算该 split 的 page 范围
+    pages_per_split = tl.cdiv(valid_pages, NUM_SPLITS)
+    split_start = pages_per_split * sid
+    split_end = tl.minimum(split_start + pages_per_split, valid_pages)
+
+    # 载入 Q 向量
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    mask_d = offs_d < head_dim
+    q = tl.load(
+        Q + bid * stride_qb + hid * stride_qh + offs_d * stride_qd,
+        mask=mask_d,
+        other=0.0,
+    )
+
+    # 遍历该 split 覆盖的所有 page
+    for pid in range(split_start, split_end):
+        # 通过 req_to_token 获得全局 page id
+        token_offset_in_seq = pid * page_size
+        global_token_idx = tl.load(Req_to_token + bid * stride_rb + token_offset_in_seq)
+        global_page_idx = global_token_idx // page_size
+
+        # 加载该 page 的 metadata
+        k_min = tl.load(
+            K_metadata + global_page_idx * stride_mp + hid * stride_mh + offs_d * stride_md + 0,
+            mask=mask_d,
+            other=0.0,
+        )
+        k_max = tl.load(
+            K_metadata + global_page_idx * stride_mp + hid * stride_mh + offs_d * stride_md + 1,
+            mask=mask_d,
+            other=0.0,
+        )
+
+        # 计算 Σ_d max(q*d_min, q*d_max)
+        qk_min = q * k_min
+        qk_max = q * k_max
+        score_per_dim = tl.maximum(qk_min, qk_max)
+        score = tl.sum(score_per_dim, axis=0)
+
+        # 写回（last page 保持为 0，因此我们只写 [0, valid_pages-1]）
+        tl.store(
+            Estimated_scores + bid * stride_sb + hid * stride_sh + pid,
+            score,
+        )
+
+
 def quest_estimate_scores(
-    q: torch.Tensor,                    # [batch, num_heads, head_dim]
-    k_metadata: torch.Tensor,           # [num_pages, num_heads, head_dim, 2]
-    seq_lens: torch.Tensor,             # [batch]
-    estimated_scores: torch.Tensor,     # 输出: [batch, num_heads, max_pages]
+    q: torch.Tensor,                    # [B, H, D]
+    k_metadata: torch.Tensor,           # [num_pages, H, D, 2]
+    seq_lens: torch.Tensor,             # [B]
+    estimated_scores: torch.Tensor,     # [B, H, max_pages]
     page_size: int,
-    req_to_token: torch.Tensor,         # [batch, max_context_len]
-    debug: bool = False,                # 是否启用 CPU 验证
+    req_to_token: torch.Tensor,         # [B, max_context_len]
+    debug: bool = False,                # CPU 验证
+    num_page_splits: int | None = None, # 若设置 >0，则使用 split 版 kernel；否则使用旧版按 page 的 kernel
 ):
     """
     Python 封装：估算 page-level 注意力得分
@@ -488,36 +580,74 @@ def quest_estimate_scores(
     
     # 计算 grid 和 block 配置
     BLOCK_DMODEL = triton.next_power_of_2(head_dim)
-    grid = (batch_size, num_heads, max_pages - 1)  # 排除 last page
-    
-    # 启动 kernel
-    nvtx.range_push("quest_estimate_kernel")
-    quest_estimate_kernel[grid](
-        q,
-        k_metadata,
-        seq_lens,
-        estimated_scores,
-        req_to_token,
-        page_size,
-        head_dim,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_metadata.stride(0),
-        k_metadata.stride(1),
-        k_metadata.stride(2),
-        estimated_scores.stride(0),
-        estimated_scores.stride(1),
-        req_to_token.stride(0),
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        num_warps=4,
-        num_stages=2,
-    )
-    nvtx.range_pop()
+    # 允许用环境变量强制开启 split 版：SGLANG_QUEST_ESTIMATE_SPLITS
+    if num_page_splits is None:
+        # try:
+        env_val = int(os.environ.get("SGLANG_QUEST_ESTIMATE_SPLITS", "0"))
+        # except Exception:
+        #     env_val = 0
+        num_page_splits = env_val if env_val > 0 else None
+
+    if num_page_splits is None:
+        # print("estimate no split")
+        # 旧实现：按 page 维度展开 grid（grid.z = max_pages-1）
+        grid = (batch_size, num_heads, max_pages - 1)
+        nvtx.range_push("quest_estimate_kernel")
+        quest_estimate_kernel[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            num_warps=4,
+            num_stages=2,
+        )
+        nvtx.range_pop()
+    else:
+        # print(f"estimate split {num_page_splits}")
+        # 新实现：固定 splits（grid.z = num_page_splits），kernel 内循环 pages
+        grid = (batch_size, num_heads, num_page_splits)
+        nvtx.range_push("quest_estimate_kernel_splits")
+        quest_estimate_split_kernel[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_SPLITS=num_page_splits,
+            num_warps=4,
+            num_stages=2,
+        )
+        nvtx.range_pop()
     
     # Debug: CPU 验证逻辑
     # 可以通过环境变量 QUEST_DEBUG_ESTIMATE=1 启用
-    import os
+    # import os
+    """
     if debug or os.environ.get("QUEST_DEBUG_ESTIMATE", "0") == "1":
         print("\n" + "="*80)
         print("Quest Estimate Scores - CPU 验证")
@@ -632,7 +762,7 @@ def quest_estimate_scores(
                     print(f"  #{i+1} [{bid},{hid},{pid}] GPU: {gpu_val:.6f}, CPU: {cpu_val:.6f}, Diff: {diff_val:.6e}")
         
         print("="*80 + "\n")
-
+    """
 
 @triton.jit
 def quest_select_topk_kernel(

@@ -14,6 +14,7 @@ Quest Attention Backend - Query-Aware Sparsity for Efficient Long-Context Infere
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Union
+import os
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -88,6 +89,14 @@ class QuestAttnBackend(AttentionBackend):
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
+        # Estimate split control: when >0, use split-kernel for estimate so grid
+        # does not depend on pages. This can be toggled via env without touching
+        # call sites. None/0 means fallback to page-parallel kernel.
+        try:
+            est_splits_env = int(os.environ.get("SGLANG_QUEST_ESTIMATE_SPLITS", "0"))
+        except Exception:
+            est_splits_env = 0
+        self.estimate_splits: Optional[int] = est_splits_env if est_splits_env > 0 else None
 
         # CUDA Graph related buffers (lazily initialized)
         self.cuda_graph_attn_logits: Optional[torch.Tensor] = None
@@ -162,6 +171,9 @@ class QuestAttnBackend(AttentionBackend):
         1. 计算当前层的 page 元数据（利用输入 k 的数据局部性）
         2. 使用标准 Triton extend attention（会写入 KV cache）
         """
+        # Optional debug-time check: ensure per-request tokens are page-aligned in the KV pool.
+        if os.environ.get("SGLANG_QUEST_CHECK_ALIGN", "0") == "1" and not get_is_capture_mode():
+            self._check_page_alignment(forward_batch)
         # Step 1: 计算 page 元数据（趁 k 还在 cache 中）
         if save_kv_cache:
             nvtx.range_push("quest_compute_extend_metadata")
@@ -204,6 +216,9 @@ class QuestAttnBackend(AttentionBackend):
         3. TopK Selection: 选择重要 pages + last page
         4. Sparse Attention: 只对选中 pages 做完整 attention
         """
+        # Optional debug-time check: ensure per-request tokens are page-aligned in the KV pool.
+        if os.environ.get("SGLANG_QUEST_CHECK_ALIGN", "0") == "1" and not get_is_capture_mode():
+            self._check_page_alignment(forward_batch)
         # Reshape q（处理 torch.compile 的 3D 输出问题）
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         
@@ -290,22 +305,30 @@ class QuestAttnBackend(AttentionBackend):
 
             # 2) Estimate page scores into preallocated buffer (static max_pages capacity)
             nvtx.range_push("quest_estimate_scores")
-            # Use a tighter static cap for pages to reduce overlaunch inside graph
+            # Estimate buffer selection under CUDA Graph:
+            # - If using split-kernel (estimate_splits>0), we MUST pass the full
+            #   buffer to avoid out-of-bounds writes when valid_pages > capture-time pages_cap.
+            # - If using page-parallel kernel, keep the pages_cap view to reduce empty CTAs.
             pages_cap = getattr(self, "_cg_estimate_pages", None)
-            if pages_cap is None:
-                pages_cap = (self.max_context_len + self.page_size - 1) // self.page_size
-            est_view = self.cuda_graph_estimated_scores[
-                : forward_batch.batch_size, :, : pages_cap
-            ]
+            if self.estimate_splits is not None and self.estimate_splits > 0:
+                est_buf = self.cuda_graph_estimated_scores[: forward_batch.batch_size]
+            else:
+                if pages_cap is None:
+                    pages_cap = (self.max_context_len + self.page_size - 1) // self.page_size
+                est_buf = self.cuda_graph_estimated_scores[
+                    : forward_batch.batch_size, :, : pages_cap
+                ]
+
             self.quest_estimate_scores(
                 q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 seq_lens=forward_batch.seq_lens,
-                estimated_scores=est_view,
+                estimated_scores=est_buf,
                 page_size=self.page_size,
                 req_to_token=forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices
                 ],
+                num_page_splits=self.estimate_splits,
             )
             nvtx.range_pop()
 
@@ -314,7 +337,7 @@ class QuestAttnBackend(AttentionBackend):
             bs_now = forward_batch.batch_size
             kv_indptr.zero_()
             self.quest_select_topk_pages_into(
-                estimated_scores=est_view,
+                estimated_scores=est_buf,
                 seq_lens=forward_batch.seq_lens,
                 req_to_token=forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices
@@ -465,3 +488,69 @@ class QuestAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    # ---------------- Internal: Page alignment checker ----------------
+
+    def _check_page_alignment(self, forward_batch: ForwardBatch):
+        """Assert each request's tokens are page-aligned in KV pool.
+
+        Conditions per batch b:
+        - The first token maps to a physical index divisible by page_size.
+        - For each logical page [p*P, (p+1)*P), the physical page id (token // P)
+          is constant across tokens in that logical page window, except the last
+          (possibly partial) page which is handled by the same rule on its span.
+
+        Raises RuntimeError with details on the first violation found.
+        """
+        req_to_token = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices
+        ]
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.numel() == 0:
+            return
+        # Small host syncs here are acceptable since this runs only in debug mode
+        max_len = int(seq_lens.max().item())
+        if max_len <= 0:
+            return
+        P = int(self.page_size)
+
+        rt = req_to_token[:, :max_len]
+        # First-token must start at page boundary
+        first_mod = (rt[:, 0] % P).to(torch.int32)
+        bad = torch.nonzero(first_mod != 0, as_tuple=False).flatten()
+        if bad.numel() > 0:
+            raise RuntimeError(
+                f"[Quest] Page alignment violated: first token not on boundary for batch indices {bad.tolist()}, page_size={P}"
+            )
+
+        page_ids = rt // P
+        bs = forward_batch.batch_size
+        for b in range(bs):
+            L = int(seq_lens[b].item())
+            if L == 0:
+                continue
+            p = 0
+            while p * P < L:
+                s = p * P
+                e = min(s + P, L)
+                cur_page_ids = page_ids[b, s:e]
+                u = torch.unique(cur_page_ids).cpu()
+                if u.numel() > 1:
+                    raise RuntimeError(
+                        f"[Quest] Page alignment violated: batch {b}, logical_page={p}, physical_pages={u.tolist()}"
+                    )
+                # Stricter check: within a logical page window, token offsets inside the page
+                # must be strictly increasing and contiguous starting from 0.
+                # Example (P=4): offsets must be [0,1,2,3] for a full page; for a partial page
+                # of length Lp, offsets must be [0,1,...,Lp-1]. Sequences like [0,2,3,1] or
+                # [0,2,3] (missing 1) are considered invalid for Quest paged indexing.
+                length = e - s
+                cur_tokens = rt[b, s:e]
+                offs = (cur_tokens % P).to(torch.int32)
+                expected = torch.arange(0, length, dtype=torch.int32, device=offs.device)
+                if not torch.equal(offs, expected):
+                    raise RuntimeError(
+                        f"[Quest] In-page order violated: batch {b}, logical_page={p}, "
+                        f"offsets={offs.tolist()}, expected={list(range(length))}"
+                    )
+                p += 1
