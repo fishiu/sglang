@@ -52,24 +52,20 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.9",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
 ]
 
 blackwell = [
     "sglang[runtime_common]",
-    "sgl-kernel",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -108,7 +104,7 @@ test = [
     "peft",
     "sentence_transformers",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]

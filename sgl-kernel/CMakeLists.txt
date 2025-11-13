@@ -78,7 +78,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        sgl-kernel
+    GIT_TAG        464f7acf1171f17c716091efcafeda22a2b3b936
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -214,6 +214,8 @@ set(SOURCES
     "csrc/attention/cascade.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    # MInference 稀疏注意力的 index 预处理 CUDA 内核（将 vertical/slash 稀疏的原始索引
+    # 转换为 block_count/block_offset/column_count/column_index 四个描述张量）
     "csrc/attention/vertical_slash_index.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
@@ -252,10 +254,15 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    # 下面四个文件来自 sgl-attn（FA2 分支）的稀疏前向实现（仅前向，禁用反向与 dropout），
+    # 支持 head_dim=128 的常见配置；与上面的 vertical_slash_index.cu 配合使用，
+    # 共同实现 vertical + slash 的统一稀疏注意力前向。
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
+    # 稀疏 FlashAttention 的 C++ API 入口（导出到 PyTorch），在 common_extension.cc 中注册为
+    # torch.ops.sgl_kernel.{fwd_sparse, varlen_fwd_sparse}
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
@@ -286,7 +293,30 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
+
+# 只为 mscclpp 设置 NUMA 环境，不影响全局
+if(DEFINED ENV{CONDA_PREFIX})
+    # 设置环境变量让 mscclpp 的 CMake 找到 NUMA
+    set(ENV{PKG_CONFIG_PATH} "$ENV{CONDA_PREFIX}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+    
+    # 临时保存当前的 CMAKE_PREFIX_PATH
+    set(ORIGINAL_CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH})
+    
+    # 为 mscclpp 添加搜索路径
+    list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+    
+    # 或者直接设置 NUMA 相关变量给 mscclpp
+    set(NUMA_ROOT "$ENV{CONDA_PREFIX}")
+    set(ENV{NUMA_ROOT} "$ENV{CONDA_PREFIX}")
+endif()
+
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
+
+# 恢复原始的 CMAKE_PREFIX_PATH（如果有修改的话）
+if(DEFINED ORIGINAL_CMAKE_PREFIX_PATH)
+    set(CMAKE_PREFIX_PATH ${ORIGINAL_CMAKE_PREFIX_PATH})
+endif()
+
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 target_compile_definitions(common_ops PRIVATE
