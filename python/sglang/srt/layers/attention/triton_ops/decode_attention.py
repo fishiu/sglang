@@ -721,7 +721,7 @@ def _decode_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)      # Value 维度的块大小
 
     if layer_id == 0:
-        print(f"PUSH attnl0")
+        # print(f"PUSH attnl0")
         nvtx.range_push(f"attnl0")
 
     fwd_kernel_stage1 = _fwd_kernel_stage1_layer0 if layer_id == 0 else _fwd_kernel_stage1

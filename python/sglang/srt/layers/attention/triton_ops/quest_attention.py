@@ -304,7 +304,7 @@ def quest_decode_attention_fwd(
     debug_info = torch.zeros((batch, head_num, MAX_KV_SPLITS, 5), dtype=torch.int32, device=q.device)
     
     if layer_id == 0:
-        print(f"PUSH quest_decode_attention_fwd_stage1")
+        # print(f"PUSH quest_decode_attention_fwd_stage1")
         nvtx.range_push(f"quest_attnl0")
     
     _quest_decode_kernel_stage1[grid](
