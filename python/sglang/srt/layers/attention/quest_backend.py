@@ -89,14 +89,8 @@ class QuestAttnBackend(AttentionBackend):
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
-        # Estimate split control: when >0, use split-kernel for estimate so grid
-        # does not depend on pages. This can be toggled via env without touching
-        # call sites. None/0 means fallback to page-parallel kernel.
-        try:
-            est_splits_env = int(os.environ.get("SGLANG_QUEST_ESTIMATE_SPLITS", "0"))
-        except Exception:
-            est_splits_env = 0
-        self.estimate_splits: Optional[int] = est_splits_env if est_splits_env > 0 else None
+        # TODO(xiaoyuan): compute splits num dynamiclly
+        self.estimate_splits: int = model_runner.server_args.quest_estimate_splits
 
         # CUDA Graph related buffers (lazily initialized)
         self.cuda_graph_attn_logits: Optional[torch.Tensor] = None
@@ -261,6 +255,7 @@ class QuestAttnBackend(AttentionBackend):
                 req_to_token=forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices
                 ],
+                num_page_splits=self.estimate_splits
             )
             nvtx.range_pop()
 

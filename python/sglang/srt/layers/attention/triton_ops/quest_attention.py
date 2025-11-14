@@ -567,8 +567,8 @@ def quest_estimate_scores(
     estimated_scores: torch.Tensor,     # [B, H, max_pages]
     page_size: int,
     req_to_token: torch.Tensor,         # [B, max_context_len]
+    num_page_splits: int,
     debug: bool = False,                # CPU 验证
-    num_page_splits: int | None = None, # 若设置 >0，则使用 split 版 kernel；否则使用旧版按 page 的 kernel
 ):
     """
     Python 封装：估算 page-level 注意力得分
@@ -580,189 +580,35 @@ def quest_estimate_scores(
     
     # 计算 grid 和 block 配置
     BLOCK_DMODEL = triton.next_power_of_2(head_dim)
-    # 允许用环境变量强制开启 split 版：SGLANG_QUEST_ESTIMATE_SPLITS
-    if num_page_splits is None:
-        # try:
-        env_val = int(os.environ.get("SGLANG_QUEST_ESTIMATE_SPLITS", "0"))
-        # except Exception:
-        #     env_val = 0
-        num_page_splits = env_val if env_val > 0 else None
 
-    if num_page_splits is None:
-        # print("estimate no split")
-        # 旧实现：按 page 维度展开 grid（grid.z = max_pages-1）
-        grid = (batch_size, num_heads, max_pages - 1)
-        nvtx.range_push("quest_estimate_kernel")
-        quest_estimate_kernel[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            num_warps=4,
-            num_stages=2,
-        )
-        nvtx.range_pop()
-    else:
-        # print(f"estimate split {num_page_splits}")
-        # 新实现：固定 splits（grid.z = num_page_splits），kernel 内循环 pages
-        grid = (batch_size, num_heads, num_page_splits)
-        nvtx.range_push("quest_estimate_kernel_splits")
-        quest_estimate_split_kernel[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            NUM_SPLITS=num_page_splits,
-            num_warps=4,
-            num_stages=2,
-        )
-        nvtx.range_pop()
-    
-    # Debug: CPU 验证逻辑
-    # 可以通过环境变量 QUEST_DEBUG_ESTIMATE=1 启用
-    # import os
-    """
-    if debug or os.environ.get("QUEST_DEBUG_ESTIMATE", "0") == "1":
-        print("\n" + "="*80)
-        print("Quest Estimate Scores - CPU 验证")
-        print("="*80)
-        
-        # 移到 CPU 进行计算
-        q_cpu = q.cpu()
-        k_metadata_cpu = k_metadata.cpu()
-        seq_lens_cpu = seq_lens.cpu()
-        req_to_token_cpu = req_to_token.cpu()
-        estimated_scores_cpu = torch.zeros_like(estimated_scores).cpu()
-        
-        # 遍历所有 (batch, head, page)
-        for bid in range(batch_size):
-            seq_len = seq_lens_cpu[bid].item()
-            num_pages = (seq_len + page_size - 1) // page_size
-            
-            for hid in range(num_heads):
-                for pid in range(max_pages - 1):  # 排除 last page
-                    # 过滤：只处理 [0, num_pages-2]
-                    if pid >= num_pages - 1:
-                        continue
-                    
-                    # 计算全局 page 索引
-                    token_offset_in_seq = pid * page_size
-                    global_token_idx = req_to_token_cpu[bid, token_offset_in_seq].item()
-                    global_page_idx = global_token_idx // page_size
-                    
-                    # 加载 Q 向量
-                    q_vec = q_cpu[bid, hid, :]  # [head_dim]
-                    
-                    # 加载元数据
-                    k_min = k_metadata_cpu[global_page_idx, hid, :, 0]  # [head_dim]
-                    k_max = k_metadata_cpu[global_page_idx, hid, :, 1]  # [head_dim]
-                    
-                    # 计算得分: sum(max(q*k_min, q*k_max))
-                    qk_min = q_vec * k_min
-                    qk_max = q_vec * k_max
-                    score = torch.maximum(qk_min, qk_max).sum().item()
-                    
-                    # 存储
-                    estimated_scores_cpu[bid, hid, pid] = score
-        
-        # 比较结果
-        estimated_scores_gpu = estimated_scores.cpu()
-        diff = torch.abs(estimated_scores_gpu - estimated_scores_cpu)
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
-        
-        # 统计有效元素（非零的 GPU 结果）
-        valid_mask = estimated_scores_gpu != 0
-        num_valid = valid_mask.sum().item()
-        
-        if num_valid > 0:
-            max_diff_valid = diff[valid_mask].max().item()
-            mean_diff_valid = diff[valid_mask].mean().item()
-            max_val = estimated_scores_gpu[valid_mask].abs().max().item()
-            relative_error = max_diff_valid / max_val if max_val > 0 else 0
-        else:
-            max_diff_valid = 0
-            mean_diff_valid = 0
-            relative_error = 0
-        
-        print(f"Batch Size: {batch_size}, Num Heads: {num_heads}, Head Dim: {head_dim}")
-        print(f"Max Pages: {max_pages}, Page Size: {page_size}")
-        print(f"有效元素数量: {num_valid} / {batch_size * num_heads * (max_pages - 1)}")
-        print(f"\n全局差异统计:")
-        print(f"  最大绝对误差: {max_diff:.6e}")
-        print(f"  平均绝对误差: {mean_diff:.6e}")
-        print(f"\n有效元素差异统计:")
-        print(f"  最大绝对误差: {max_diff_valid:.6e}")
-        print(f"  平均绝对误差: {mean_diff_valid:.6e}")
-        print(f"  最大相对误差: {relative_error:.6e}")
-        
-        # 显示几个样本对比
-        print(f"\n样本对比（前 5 个有效元素）:")
-        count = 0
-        for bid in range(batch_size):
-            if count >= 5:
-                break
-            for hid in range(num_heads):
-                if count >= 5:
-                    break
-                for pid in range(max_pages - 1):
-                    if count >= 5:
-                        break
-                    if valid_mask[bid, hid, pid]:
-                        gpu_val = estimated_scores_gpu[bid, hid, pid].item()
-                        cpu_val = estimated_scores_cpu[bid, hid, pid].item()
-                        diff_val = diff[bid, hid, pid].item()
-                        print(f"  [{bid},{hid},{pid}] GPU: {gpu_val:.6f}, CPU: {cpu_val:.6f}, Diff: {diff_val:.6e}")
-                        count += 1
-        
-        # 判断是否通过
-        TOLERANCE = 1e-2  # 相对误差容忍度
-        if relative_error < TOLERANCE:
-            print(f"\n✅ 验证通过！相对误差 {relative_error:.6e} < {TOLERANCE}")
-        else:
-            print(f"\n❌ 验证失败！相对误差 {relative_error:.6e} >= {TOLERANCE}")
-            print("\n显示前 10 个最大误差的位置:")
-            flat_diff = diff.flatten()
-            flat_indices = torch.argsort(flat_diff, descending=True)[:10]
-            for i, flat_idx in enumerate(flat_indices):
-                idx = flat_idx.item()
-                bid = idx // (num_heads * max_pages)
-                hid = (idx // max_pages) % num_heads
-                pid = idx % max_pages
-                if pid < max_pages - 1:  # 只显示有效的 page
-                    gpu_val = estimated_scores_gpu[bid, hid, pid].item()
-                    cpu_val = estimated_scores_cpu[bid, hid, pid].item()
-                    diff_val = diff[bid, hid, pid].item()
-                    print(f"  #{i+1} [{bid},{hid},{pid}] GPU: {gpu_val:.6f}, CPU: {cpu_val:.6f}, Diff: {diff_val:.6e}")
-        
-        print("="*80 + "\n")
-    """
+    # print(f"estimate split {num_page_splits}")
+    # 新实现：固定 splits（grid.z = num_page_splits），kernel 内循环 pages
+    grid = (batch_size, num_heads, 8)
+    nvtx.range_push("quest_estimate_kernel_splits")
+    quest_estimate_split_kernel[grid](
+        q,
+        k_metadata,
+        seq_lens,
+        estimated_scores,
+        req_to_token,
+        page_size,
+        head_dim,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_metadata.stride(0),
+        k_metadata.stride(1),
+        k_metadata.stride(2),
+        estimated_scores.stride(0),
+        estimated_scores.stride(1),
+        req_to_token.stride(0),
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        NUM_SPLITS=num_page_splits,
+        num_warps=4,
+        num_stages=2,
+    )
+    nvtx.range_pop()
+
 
 @triton.jit
 def quest_select_topk_kernel(

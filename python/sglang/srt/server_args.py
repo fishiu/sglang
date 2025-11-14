@@ -182,6 +182,7 @@ class ServerArgs:
     # Quest (Query-Aware Sparsity)
     enable_quest: bool = False
     quest_topk: int = 16  # Maximum number of pages to keep (excluding last page)
+    quest_estimate_splits: int = 8
 
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
@@ -1339,6 +1340,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.quest_topk,
             help="Maximum number of pages to keep in Quest sparse attention (excluding last page). Default: 16",
+        )
+        parser.add_argument(
+            "--quest-estimate-splits",
+            type=int,
+            default=ServerArgs.quest_estimate_splits,
+            help="Triton grid size when computing estimate scores, split all pages. Default: 8",
         )
 
         # StreamingLLM (Attention Sinks)
