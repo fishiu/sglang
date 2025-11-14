@@ -838,9 +838,26 @@ def quest_select_topk_pages(
         num_heads=num_heads,
     )
 
+    # Reshape to per-batch, per-head counts: [bs, Hq]
     tokens_per_head = tokens_per_head.view(batch_size, num_heads)
-    # 为满足 decode 内核“各 head 相同长度”的约束，取各 head 的最小值作为本 batch 的有效长度
-    tokens_per_batch = torch.min(tokens_per_head, dim=1).values.contiguous()
+
+    # All heads are guaranteed to select the same number of tokens for a given batch
+    # (only the specific token ids may differ). Therefore we can simply take the
+    # first head's length per batch as tokens_per_batch to avoid a redundant reduction.
+    # Shapes:
+    # - tokens_per_head: [bs, Hq]
+    # - tokens_per_batch: [bs]
+    tokens_per_batch = tokens_per_head[:, 0].contiguous()
+
+    # TODO(xiaoyuan): remove env var
+    # Optional strict check (debug): verify all heads agree on the count per batch.
+    if os.environ.get("QUEST_ASSERT_EQUAL_TOKENS", "0") == "1" and batch_size > 0:
+        # Check each row equals its first element across heads
+        ref = tokens_per_batch[:, None].expand_as(tokens_per_head)
+        if not torch.equal(tokens_per_head, ref):
+            raise RuntimeError(
+                "[Quest] tokens_per_head are not equal across heads within a batch."
+            )
 
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     torch.cumsum(tokens_per_batch, dim=0, out=kv_indptr[1:])
@@ -1017,13 +1034,21 @@ def quest_select_topk_pages_into(
         num_heads=num_heads,
     )
 
-    # 3) min across heads -> per-batch token count
+    # 3) per-batch token count: take the first head's length (all heads are equal)
     if bs > 0:
-        quest_min_tokens_per_batch_kernel[(bs,)](
-            tokens_per_head,
-            tokens_per_batch,
-            num_heads=num_heads,
-        )
+        # tokens_per_head: 1D [(bs * Hq)] -> 2D [bs, Hq]
+        tph_2d = tokens_per_head.view(bs, num_heads)
+
+        # Optional strict check (debug): ensure equality across heads
+        if os.environ.get("QUEST_ASSERT_EQUAL_TOKENS", "0") == "1":
+            ref = tph_2d[:, :1].expand_as(tph_2d)
+            if not torch.equal(tph_2d, ref):
+                raise RuntimeError(
+                    "[Quest] tokens_per_head are not equal across heads within a batch."
+                )
+
+        # Fill tokens_per_batch[:bs] from the first head
+        tokens_per_batch.copy_(tph_2d[:, 0].contiguous())
     # kv_indptr[0] expected to be set by caller; compute cumsum into kv_indptr[1:]
     torch.cumsum(tokens_per_batch, dim=0, out=kv_indptr[1:])
 
