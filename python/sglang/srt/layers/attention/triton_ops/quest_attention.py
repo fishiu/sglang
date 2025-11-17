@@ -472,10 +472,10 @@ def quest_estimate_kernel(
 
 @triton.jit
 def quest_estimate_split_kernel(
-    Q,                      # [batch, num_heads, head_dim]
-    K_metadata,             # [num_pages, num_heads, head_dim, 2]
+    Q,                      # [batch, num_q_heads, head_dim]
+    K_metadata,             # [num_pages, num_kv_heads, head_dim, 2]
     Seq_lens,               # [batch]
-    Estimated_scores,       # 输出: [batch, num_heads, max_pages]
+    Estimated_scores,       # 输出: [batch, num_q_heads, max_pages]
     Req_to_token,           # [batch, max_context_len]
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -490,23 +490,24 @@ def quest_estimate_split_kernel(
     stride_rb,
     BLOCK_DMODEL: tl.constexpr,
     NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
+    kv_group_num: tl.constexpr,   # = num_q_heads // num_kv_heads
 ):
     """
     Estimate（split 版本）：将原先按 page 维展开的网格，改为固定的 splits 维度。
 
-    网格：grid = (batch, num_heads, NUM_SPLITS)
+    网格：grid = (batch, num_q_heads, NUM_SPLITS)
     - 每个 split 负责一段 page 区间：[split_start, split_end)
     - 仅计算非 last page（保持与旧逻辑一致）
 
     张量形状：
-    - Q:                [B, H, D]
-    - K_metadata:       [num_pages_global, H, D, 2]
+    - Q:                [B, Hq, D]
+    - K_metadata:       [num_pages_global, Hkv, D, 2]
     - Seq_lens:         [B]
     - Estimated_scores: [B, H, max_pages]
     - Req_to_token:     [B, max_context_len]
     """
     bid = tl.program_id(0)  # batch index
-    hid = tl.program_id(1)  # head index
+    hid = tl.program_id(1)  # q_head index
     sid = tl.program_id(2)  # split index
 
     # 当前 batch 的页数（向上取整）
@@ -535,14 +536,15 @@ def quest_estimate_split_kernel(
         global_token_idx = tl.load(Req_to_token + bid * stride_rb + token_offset_in_seq)
         global_page_idx = global_token_idx // page_size
 
-        # 加载该 page 的 metadata
+        # 加载该 page 的 metadata（注意 GQA：Q 头映射到 KV 头）
+        kv_hid = hid // kv_group_num
         k_min = tl.load(
-            K_metadata + global_page_idx * stride_mp + hid * stride_mh + offs_d * stride_md + 0,
+            K_metadata + global_page_idx * stride_mp + kv_hid * stride_mh + offs_d * stride_md + 0,
             mask=mask_d,
             other=0.0,
         )
         k_max = tl.load(
-            K_metadata + global_page_idx * stride_mp + hid * stride_mh + offs_d * stride_md + 1,
+            K_metadata + global_page_idx * stride_mp + kv_hid * stride_mh + offs_d * stride_md + 1,
             mask=mask_d,
             other=0.0,
         )
@@ -561,10 +563,10 @@ def quest_estimate_split_kernel(
 
 
 def quest_estimate_scores(
-    q: torch.Tensor,                    # [B, H, D]
-    k_metadata: torch.Tensor,           # [num_pages, H, D, 2]
+    q: torch.Tensor,                    # [B, Hq, D]
+    k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
     seq_lens: torch.Tensor,             # [B]
-    estimated_scores: torch.Tensor,     # [B, H, max_pages]
+    estimated_scores: torch.Tensor,     # [B, Hq, max_pages]
     page_size: int,
     req_to_token: torch.Tensor,         # [B, max_context_len]
     num_page_splits: int,
@@ -575,7 +577,7 @@ def quest_estimate_scores(
     
     输出 estimated_scores 中，最后一个 page 的得分保持为 0（不参与 TopK）
     """
-    batch_size, num_heads, head_dim = q.shape
+    batch_size, num_q_heads, head_dim = q.shape
     max_pages = estimated_scores.shape[-1]
     
     # 计算 grid 和 block 配置
@@ -583,7 +585,12 @@ def quest_estimate_scores(
 
     # print(f"estimate split {num_page_splits}")
     # 新实现：固定 splits（grid.z = num_page_splits），kernel 内循环 pages
-    grid = (batch_size, num_heads, 8)
+    grid = (batch_size, num_q_heads, 8)
+
+    # GQA: map Q heads to KV heads inside kernel via kv_group_num
+    num_kv_heads = k_metadata.shape[1]
+    assert num_q_heads % num_kv_heads == 0, "Invalid GQA config: Hq must be multiple of Hkv"
+    kv_group_num = num_q_heads // num_kv_heads
     nvtx.range_push("quest_estimate_kernel_splits")
     quest_estimate_split_kernel[grid](
         q,
@@ -604,6 +611,7 @@ def quest_estimate_scores(
         req_to_token.stride(0),
         BLOCK_DMODEL=BLOCK_DMODEL,
         NUM_SPLITS=num_page_splits,
+        kv_group_num=kv_group_num,
         num_warps=4,
         num_stages=2,
     )

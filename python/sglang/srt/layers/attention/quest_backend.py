@@ -22,6 +22,7 @@ import torch.cuda.nvtx as nvtx
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -69,8 +70,14 @@ class QuestAttnBackend(AttentionBackend):
         # 配置参数
         self.quest_topk = model_runner.server_args.quest_topk
         self.page_size = model_runner.server_args.page_size
-        self.num_head = model_runner.model_config.num_attention_heads
-        self.head_dim = model_runner.model_config.hidden_size // self.num_head
+        # Per-TP head counts (Q and KV)
+        tp_size = get_attention_tp_size()
+        self.num_q_head = model_runner.model_config.num_attention_heads // tp_size
+        self.num_kv_head = model_runner.model_config.get_num_kv_heads(tp_size)
+        # Use Q-head count where a single head count is required
+        self.num_head = self.num_q_head
+        # Per-head dimension
+        self.head_dim = model_runner.model_config.head_dim
         
         # Extend 阶段 delegation：创建 TritonAttnBackend 实例
         # 用于处理非 Quest 的 extend 路径
@@ -172,7 +179,8 @@ class QuestAttnBackend(AttentionBackend):
         if save_kv_cache:
             nvtx.range_push("quest_compute_extend_metadata")
             self.quest_compute_extend_metadata(
-                k_new=k.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                # For GQA, metadata is per KV head
+                k_new=k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 out_cache_loc=forward_batch.out_cache_loc,
                 extend_start_loc=forward_batch.extend_start_loc,
@@ -234,8 +242,8 @@ class QuestAttnBackend(AttentionBackend):
             if save_kv_cache:
                 nvtx.range_push("quest_update_kv_and_metadata")
                 self.quest_update_kv_and_metadata(
-                    k_new=k.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    v_new=v.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_new=k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_new=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                     k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                     v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                     k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
@@ -288,8 +296,8 @@ class QuestAttnBackend(AttentionBackend):
             if save_kv_cache:
                 nvtx.range_push("quest_update_kv_and_metadata")
                 self.quest_update_kv_and_metadata(
-                    k_new=k.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    v_new=v.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_new=k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_new=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                     k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                     v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                     k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
