@@ -78,6 +78,9 @@ class QuestAttnBackend(AttentionBackend):
         self.num_head = self.num_q_head
         # Per-head dimension
         self.head_dim = model_runner.model_config.head_dim
+        # Quest GQA mode: when True, keep per-Q-head selection (weak GQA).
+        # When False, group Q heads that share a KV head for estimate/select (strong GQA).
+        self.use_weak_gqa = getattr(model_runner.server_args, "quest_use_weak_gqa", False)
         
         # Extend 阶段 delegation：创建 TritonAttnBackend 实例
         # 用于处理非 Quest 的 extend 路径
@@ -237,6 +240,13 @@ class QuestAttnBackend(AttentionBackend):
             and "kv_indices" in self.forward_metadata
         )
 
+        # Attention pattern
+        kv_group_num = 1
+        if layer.tp_k_head_num > 0:
+            kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
+        is_mha = kv_group_num == 1
+        use_weak = self.use_weak_gqa or is_mha
+
         if not use_graph_meta:
             # Step 1: 更新 KV cache 和元数据
             if save_kv_cache:
@@ -254,8 +264,9 @@ class QuestAttnBackend(AttentionBackend):
 
             # Step 2: Estimate - 估算 page-level 注意力得分
             nvtx.range_push("quest_estimate_scores")
+            q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             self.quest_estimate_scores(
-                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                q=q_3d,
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 seq_lens=forward_batch.seq_lens,
                 estimated_scores=self.estimated_scores,
@@ -263,7 +274,8 @@ class QuestAttnBackend(AttentionBackend):
                 req_to_token=forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices
                 ],
-                num_page_splits=self.estimate_splits
+                num_page_splits=self.estimate_splits,
+                grouped=not use_weak,
             )
             nvtx.range_pop()
 
@@ -332,6 +344,7 @@ class QuestAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices
                 ],
                 num_page_splits=self.estimate_splits,
+                grouped=not use_weak,
             )
             nvtx.range_pop()
 
@@ -377,6 +390,7 @@ class QuestAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             layer_id=layer.layer_id,
+            force_kv_group_num=1 if use_weak else None,
         )
         nvtx.range_pop()
         

@@ -183,6 +183,10 @@ class ServerArgs:
     enable_quest: bool = False
     quest_topk: int = 16  # Maximum number of pages to keep (excluding last page)
     quest_estimate_splits: int = 8
+    # Quest GQA mode: when True, use the original per-Q-head selection ("weak" GQA).
+    # When False (default), strong GQA groups Q heads that share a KV head and lets
+    # each group jointly select pages/tokens.
+    quest_use_weak_gqa: bool = False
 
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
@@ -1346,6 +1350,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.quest_estimate_splits,
             help="Triton grid size when computing estimate scores, split all pages. Default: 8",
+        )
+        parser.add_argument(
+            "--quest-use-weak-gqa",
+            action="store_true",
+            help=(
+                "Use per-Q-head selection for GQA models (weak GQA). "
+                "By default (flag off), Quest groups Q heads that share a KV head "
+                "and lets each group jointly select pages/tokens (strong GQA)."
+            ),
         )
 
         # StreamingLLM (Attention Sinks)

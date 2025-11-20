@@ -195,6 +195,242 @@ def _quest_decode_kernel_stage1(
 
 
 @triton.jit
+def _quest_decode_grouped_kernel_stage1(
+    Q,                  # [batch, num_q_heads, head_dim]
+    K_Buffer,           # [size, num_kv_heads, head_dim]
+    V_Buffer,           # [size, num_kv_heads, v_head_dim]
+    sm_scale,
+    kv_indptr,          # [batch + 1]
+    kv_indices,         # [total_selected_tokens]
+    Att_Out,            # [batch, num_q_heads, max_kv_splits, v_head_dim]
+    Att_Lse,            # [batch, num_q_heads, max_kv_splits]
+    num_kv_splits,      # [batch]
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    num_q_heads: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,   # padded head_dim (K dimension for QK)
+    BLOCK_DV: tl.constexpr,       # padded v_head_dim (N dimension for PV)
+    BLOCK_N: tl.constexpr,        # tokens per iteration in sequence dim
+    BLOCK_H: tl.constexpr,        # max Q heads per CTA tile
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """Grouped Quest decode stage1.
+
+    Each program (CTA) handles a *tile* of query heads that belong to some KV
+    head, for a specific (batch, split) pair.
+
+    Head tiling strategy (mirrors decode_attention._fwd_grouped_kernel_stage1):
+    - Global Q heads:        0 .. num_q_heads-1
+    - GQA group size:        kv_group_num (H_q / H_kv)
+    - Per KV group CTA tile: BLOCK_H (<= kv_group_num or equal to it)
+    - Grid dim1 (head blocks): cdiv(num_q_heads, min(BLOCK_H, kv_group_num))
+
+    Inside the kernel:
+    - We infer KV head index from head-block id and kv_group_num/BLOCK_H.
+    - For that KV head, we compute attention for up to BLOCK_H Q heads in its
+      group, using masks to skip out-of-range heads.
+
+    Tensor shapes (logical view):
+    - Q:        [B, Hq, D]          (query vectors)
+    - K_Buffer: [T, Hkv, D]         (key cache, shared across groups)
+    - V_Buffer: [T, Hkv, Dv]        (value cache)
+    - kv_indptr: [B + 1]            (per-batch token counts, shared by all heads)
+    - kv_indices: flattened indices; for Quest layout we treat the segment of
+      the *first* Q head in each KV group as the canonical token sequence.
+    - Att_Out: [B, Hq, S, Dv]       (stage1 partial outputs)
+    - Att_Lse: [B, Hq, S]           (per-split log-sum-exp)
+
+    Compared to the initial Quest grouped kernel, this version mirrors
+    decode_attention._fwd_grouped_kernel_stage1 more closely:
+    - K and V are loaded in [D, N] / [N, Dv] layouts suitable for tl.dot
+    - QK and P*V use tl.dot so that Triton can map them to matrix instructions
+    - head dimension is blocked with BLOCK_H and masked at the tail
+    """
+    # Program ids:
+    # - pid(0): batch index b
+    # - pid(1): "head block id" (not directly the KV head id)
+    # - pid(2): split index s over the selected tokens
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    # Derive KV head id from the head-block id.
+    # When kv_group_num <= BLOCK_H: cdiv(kv_group_num, BLOCK_H) == 1,
+    # so cur_kv_head == cur_head_id (one CTA per KV head).
+    # When kv_group_num  > BLOCK_H: a KV group spans multiple head blocks.
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+
+    # Effective number of Q heads per block (may be smaller than BLOCK_H
+    # when kv_group_num < BLOCK_H).
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+
+    # Compute the global Q head indices covered by this head block.
+    # cur_head: [BLOCK_H], but only the first VALID_BLOCK_H entries belong
+    # to this KV group; the rest are masked out.
+    offs_h = tl.arange(0, BLOCK_H)
+    cur_head = cur_head_id * VALID_BLOCK_H + offs_h
+    # Mask heads that are outside this block's valid range or beyond Hq.
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < num_q_heads)
+
+    # Head / value dimensions
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    # Per-batch token range (shared by all heads within this batch)
+    cur_batch_token_start = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_token_start
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    # Offsets into Q:
+    # offs_q has shape [BLOCK_H, BLOCK_DMODEL] and indexes Q[b, cur_head, :]
+    offs_q = (
+        cur_batch * stride_qbs
+        + cur_head[:, None] * stride_qh
+        + offs_d[None, :]
+    )
+
+    # Split range on the selected tokens of this batch
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    # Online softmax state per Q head in this group
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        # Load Q: [BLOCK_H, BLOCK_DMODEL]
+        q = tl.load(
+            Q + offs_q,
+            mask=(mask_h[:, None]) & (mask_d[None, :]),
+            other=0.0,
+        )
+
+        # We only materialize the token index sequence from the first Q head
+        # in this KV group. Quest's kv_indices layout is:
+        #   kv_indices: flattened over [B, Hq, L_b]
+        # where each Q head has its own contiguous segment of length L_b.
+        # Here we take the base_head segment as the canonical one and
+        # reuse it for all Q heads in the same KV group.
+        base_head = cur_kv_head * kv_group_num  # first Q head for this KV head
+        base_tokens_before = cur_batch_token_start  # starting offset (per-batch)
+        base = base_tokens_before * num_q_heads + base_head * cur_batch_seq_len
+
+        # Iterate over tokens in this split with BLOCK_N granularity
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+
+            # Load logical token locations (global token ids in KV cache)
+            kv_loc = tl.load(
+                kv_indices + base + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            # Load K as [BLOCK_DMODEL, BLOCK_N]:
+            # - first dim: head_dim (K)
+            # - second dim: token index within this split (N)
+            # This layout matches tl.dot([H, K], [K, N]) -> [H, N].
+            offs_buf_k = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[:, None]
+            )
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                other=0.0,
+            )
+
+            # QK: [BLOCK_H, BLOCK_N]
+            qk = tl.dot(q, k.to(q.dtype))
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            # Mask out:
+            # - inactive heads (mask_h)
+            # - tokens beyond split_kv_end
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                qk,
+                float("-inf"),
+            )
+
+            # Load V as [BLOCK_N, BLOCK_DV]
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                other=0.0,
+            )
+
+            # Online softmax update across the N dimension
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)  # [BLOCK_H]
+            re_scale = tl.exp(e_max - n_e_max)          # [BLOCK_H]
+            p = tl.exp(qk - n_e_max[:, None])           # [BLOCK_H, BLOCK_N]
+
+            acc *= re_scale[:, None]
+            # p: [BLOCK_H, BLOCK_N], v: [BLOCK_N, BLOCK_DV]
+            acc += tl.dot(p.to(v.dtype), v)            # [BLOCK_H, BLOCK_DV]
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        # Store per-split partial outputs
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+
+        # Store per-split LSE for later Stage2 merge
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
+
+
+@triton.jit
 def _quest_decode_kernel_stage2(
     Mid_O,          # [batch, num_heads, max_kv_splits, v_head_dim]
     Mid_O_1,        # [batch, num_heads, max_kv_splits]
@@ -265,19 +501,20 @@ def _quest_decode_kernel_stage2(
 
 
 def quest_decode_attention_fwd(
-    q,              # [batch, num_heads, head_dim]
-    k_buffer,       # [size, num_heads, head_dim]
-    v_buffer,       # [size, num_heads, v_head_dim]
-    o,              # [batch, num_heads, v_head_dim]
+    q,              # [batch, num_q_heads, head_dim]
+    k_buffer,       # [size, num_kv_heads, head_dim]
+    v_buffer,       # [size, num_kv_heads, v_head_dim]
+    o,              # [batch, num_q_heads, v_head_dim]
     kv_indptr,      # [batch + 1] - 所有 head 共享相同的 token 数量
     kv_indices,     # [total_selected_tokens]
-    attn_logits,    # [batch, num_heads, max_kv_splits, v_head_dim]
-    attn_lse,       # [batch, num_heads, max_kv_splits]
+    attn_logits,    # [batch, num_q_heads, max_kv_splits, v_head_dim]
+    attn_lse,       # [batch, num_q_heads, max_kv_splits]
     num_kv_splits,  # [batch]
     max_kv_splits,  # int
     sm_scale,       # float
     logit_cap=0.0,
     layer_id=None,
+    force_kv_group_num: int | None = None,
 ):
     """
     Quest Decode Attention Forward (两阶段)
@@ -292,58 +529,109 @@ def quest_decode_attention_fwd(
     
     batch, head_num = q.shape[0], q.shape[1]
     MAX_KV_SPLITS = max_kv_splits
-    
+
     # Stage1: 计算部分结果
-    grid = (batch, head_num, MAX_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
-    
-    num_warps = 4 if kv_group_num == 1 else 2
+    if force_kv_group_num is not None:
+        kv_group_num = force_kv_group_num
+
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    # Create debug info tensor: [batch, num_heads, max_kv_splits, 5]
-    debug_info = torch.zeros((batch, head_num, MAX_KV_SPLITS, 5), dtype=torch.int32, device=q.device)
-    
-    if layer_id == 0:
-        # print(f"PUSH quest_decode_attention_fwd_stage1")
-        nvtx.range_push(f"quest_attnl0")
-    
-    _quest_decode_kernel_stage1[grid](
-        q,
-        k_buffer,
-        v_buffer,
-        sm_scale,
-        kv_indptr,
-        kv_indices,
-        attn_logits,
-        attn_lse,
-        num_kv_splits,
-        debug_info,
-        q.stride(0),
-        q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        attn_logits.stride(0),
-        attn_logits.stride(1),
-        attn_logits.stride(2),
-        kv_group_num=kv_group_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        MIN_BLOCK_KV=32,
-        logit_cap=logit_cap,
-        num_warps=num_warps,
-        num_stages=2,
-        Lk=Lk,
-        Lv=Lv,
-        head_num=head_num,
-        MAX_KV_SPLITS=MAX_KV_SPLITS,
-    )
+    if kv_group_num == 1:
+        # MHA / weak GQA: 每个 Q head 独立计算（与原始 Quest 行为一致）
+        grid = (batch, head_num, MAX_KV_SPLITS)
+        num_warps = 4
 
-    if layer_id == 0:
-        nvtx.range_pop()
+        # Create debug info tensor: [batch, num_heads, max_kv_splits, 5]
+        debug_info = torch.zeros(
+            (batch, head_num, MAX_KV_SPLITS, 5),
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+        if layer_id == 0:
+            nvtx.range_push("quest_attnl0")
+
+        _quest_decode_kernel_stage1[grid](
+            q,
+            k_buffer,
+            v_buffer,
+            sm_scale,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            debug_info,
+            q.stride(0),
+            q.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            kv_group_num=kv_group_num,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_N=BLOCK,
+            MIN_BLOCK_KV=32,
+            logit_cap=logit_cap,
+            num_warps=num_warps,
+            num_stages=2,
+            Lk=Lk,
+            Lv=Lv,
+            head_num=head_num,
+            MAX_KV_SPLITS=MAX_KV_SPLITS,
+        )
+
+        if layer_id == 0:
+            nvtx.range_pop()
+    else:
+        # Strong GQA: grouped kernel，一次处理一个 KV head 对应的 kv_group_num 个 Q heads
+        # We follow decode_attention._decode_grouped_att_m_fwd:
+        # - Head dimension is blocked with BLOCK_H Q heads per CTA
+        # - grid_y = cdiv(Hq, min(BLOCK_H, kv_group_num))
+        #   so that all Q heads are covered.
+        BLOCK_H = 16
+        grid = (
+            batch,
+            triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+            MAX_KV_SPLITS,
+        )
+
+        _quest_decode_grouped_kernel_stage1[grid](
+            q,
+            k_buffer,
+            v_buffer,
+            sm_scale,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            q.stride(0),
+            q.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            kv_group_num=kv_group_num,
+            num_q_heads=head_num,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_N=BLOCK,
+            BLOCK_H=BLOCK_H,
+            MIN_BLOCK_KV=32,
+            logit_cap=logit_cap,
+            Lk=Lk,
+            Lv=Lv,
+        )
         
     # # Print debug info in a readable format
     # print("\n" + "="*80)
@@ -475,7 +763,7 @@ def quest_estimate_split_kernel(
     Q,                      # [batch, num_q_heads, head_dim]
     K_metadata,             # [num_pages, num_kv_heads, head_dim, 2]
     Seq_lens,               # [batch]
-    Estimated_scores,       # 输出: [batch, num_q_heads, max_pages]
+    Estimated_scores,       # Output: [batch, num_q_heads, max_pages]
     Req_to_token,           # [batch, max_context_len]
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -562,6 +850,129 @@ def quest_estimate_split_kernel(
         )
 
 
+@triton.jit
+def quest_estimate_split_kernel_grouped(
+    Q,                      # [batch, num_q_heads, head_dim]
+    K_metadata,             # [num_pages, num_kv_heads, head_dim, 2]
+    Seq_lens,               # [batch]
+    Estimated_scores,       # Output: [batch, num_q_heads, max_pages]
+    Req_to_token,           # [batch, max_context_len]
+    page_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_mp,
+    stride_mh,
+    stride_md,
+    stride_sb,
+    stride_sh,
+    stride_rb,
+    BLOCK_DMODEL: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
+    kv_group_num: tl.constexpr,   # = num_q_heads // num_kv_heads
+):
+    """
+    Strong-GQA Estimate（split 版本，按 KV 组聚合）。
+
+    网格：grid = (batch, num_kv_heads, NUM_SPLITS)
+    - 每个 program 处理一个 (batch=b, kv_head=h_kv, split=s) 组合。
+    - 内部遍历该 KV 组下的所有 Q heads（大小 = kv_group_num），对 score 做
+      group-reduction：
+          score_group(page) = Σ_{h_q in group} score(q_{h_q}, K_page)
+    - 然后将 group score 写回到 Estimated_scores 中组内所有 Q heads 的槽位：
+          Estimated_scores[b, h_q, page] = score_group(page)
+
+    张量形状：
+    - Q:                [B, Hq, D]
+    - K_metadata:       [num_pages_global, Hkv, D, 2]
+    - Seq_lens:         [B]
+    - Estimated_scores: [B, Hq, max_pages]  （按 Q head 存储，组内 head 共享同一值）
+    - Req_to_token:     [B, max_context_len]
+
+    注意：
+    - 这里假设 GQA 配置满足 Hq = Hkv * kv_group_num。
+    - 为了避免在 Python 侧再做一次 group-reduction，这里直接在 kernel
+      内对 group 维度求和，并同时广播回所有组内 Q heads。
+    """
+    bid = tl.program_id(0)  # batch index
+    kv_hid = tl.program_id(1)  # kv_head index (group id)
+    sid = tl.program_id(2)  # split index
+
+    # 当前 batch 的页数（向上取整）
+    seq_len = tl.load(Seq_lens + bid)
+    num_pages = (seq_len + page_size - 1) // page_size
+    valid_pages = tl.maximum(num_pages - 1, 0)  # 排除 last page
+
+    # 计算该 split 的 page 范围
+    pages_per_split = tl.cdiv(valid_pages, NUM_SPLITS)
+    split_start = pages_per_split * sid
+    split_end = tl.minimum(split_start + pages_per_split, valid_pages)
+
+    # 预备 head_dim 维度的 offsets/mask
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    mask_d = offs_d < head_dim
+
+    # 遍历该 split 覆盖的所有 page（仅 [0, valid_pages-1]）
+    for pid in range(split_start, split_end):
+        # 通过 req_to_token 获得全局 page id
+        token_offset_in_seq = pid * page_size
+        global_token_idx = tl.load(Req_to_token + bid * stride_rb + token_offset_in_seq)
+        global_page_idx = global_token_idx // page_size
+
+        # 加载该 page 的 metadata（按 KV head 维度）
+        k_min = tl.load(
+            K_metadata
+            + global_page_idx * stride_mp
+            + kv_hid * stride_mh
+            + offs_d * stride_md
+            + 0,
+            mask=mask_d,
+            other=0.0,
+        )
+        k_max = tl.load(
+            K_metadata
+            + global_page_idx * stride_mp
+            + kv_hid * stride_mh
+            + offs_d * stride_md
+            + 1,
+            mask=mask_d,
+            other=0.0,
+        )
+
+        # 对该 KV 组内的所有 Q heads 累加 score
+        group_score = tl.zeros((), dtype=tl.float32)
+
+        # kv_group_num 是 constexpr，循环会被 Triton 展开：
+        # 对于每个组内 head：
+        for g in range(kv_group_num):
+            # 该组内 Q head 的全局索引 h_q
+            hq = kv_hid * kv_group_num + g
+
+            # 加载该 Q head 的向量 q[b, h_q, :]
+            q = tl.load(
+                Q + bid * stride_qb + hq * stride_qh + offs_d * stride_qd,
+                mask=mask_d,
+                other=0.0,
+            )
+
+            # Σ_d max(q_d * k_min_d, q_d * k_max_d)
+            qk_min = q * k_min
+            qk_max = q * k_max
+            score_per_dim = tl.maximum(qk_min, qk_max)
+            score_i = tl.sum(score_per_dim, axis=0)
+
+            group_score += score_i
+
+        # 将 group_score 写回到该 KV 组内所有 Q heads 的 Estimated_scores 槽位
+        for g in range(kv_group_num):
+            hq = kv_hid * kv_group_num + g
+            tl.store(
+                Estimated_scores + bid * stride_sb + hq * stride_sh + pid,
+                group_score,
+            )
+
+
 def quest_estimate_scores(
     q: torch.Tensor,                    # [B, Hq, D]
     k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
@@ -570,6 +981,7 @@ def quest_estimate_scores(
     page_size: int,
     req_to_token: torch.Tensor,         # [B, max_context_len]
     num_page_splits: int,
+    grouped: bool = False,              # 是否在 KV 组上做 score 的 group-reduction
     debug: bool = False,                # CPU 验证
 ):
     """
@@ -579,42 +991,76 @@ def quest_estimate_scores(
     """
     batch_size, num_q_heads, head_dim = q.shape
     max_pages = estimated_scores.shape[-1]
-    
-    # 计算 grid 和 block 配置
+
+    # 计算 grid 和 block 配置（head_dim 向上取 2 的幂，方便 Triton 向量化）
     BLOCK_DMODEL = triton.next_power_of_2(head_dim)
 
-    # print(f"estimate split {num_page_splits}")
-    # 新实现：固定 splits（grid.z = num_page_splits），kernel 内循环 pages
-    grid = (batch_size, num_q_heads, 8)
+    # Splits 配置：固定 NUM_SPLITS，kernel 内部循环 pages。
+    # num_page_splits 是一个较小的常数（如 8/16/32），用于在 page 维做粗
+    # 粒度切分，避免单个 program 处理过长的 page 区间。
+    if num_page_splits is None or num_page_splits <= 0:
+        num_page_splits = 1
 
-    # GQA: map Q heads to KV heads inside kernel via kv_group_num
+    # GQA: map Q heads to KV heads via kv_group_num
     num_kv_heads = k_metadata.shape[1]
     assert num_q_heads % num_kv_heads == 0, "Invalid GQA config: Hq must be multiple of Hkv"
     kv_group_num = num_q_heads // num_kv_heads
     nvtx.range_push("quest_estimate_kernel_splits")
-    quest_estimate_split_kernel[grid](
-        q,
-        k_metadata,
-        seq_lens,
-        estimated_scores,
-        req_to_token,
-        page_size,
-        head_dim,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_metadata.stride(0),
-        k_metadata.stride(1),
-        k_metadata.stride(2),
-        estimated_scores.stride(0),
-        estimated_scores.stride(1),
-        req_to_token.stride(0),
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        NUM_SPLITS=num_page_splits,
-        kv_group_num=kv_group_num,
-        num_warps=4,
-        num_stages=2,
-    )
+
+    if not grouped or kv_group_num == 1:
+        # 弱 GQA / MHA：直接按 Q head 维度并行，每个 head 独立估计 page scores。
+        grid = (batch_size, num_q_heads, num_page_splits)
+        quest_estimate_split_kernel[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_SPLITS=num_page_splits,
+            kv_group_num=kv_group_num,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        # 强 GQA：按 KV head 维度并行，在 kernel 内对组内所有 Q heads 做 score
+        # 的 group-reduction，并将 group score 回写到每个 Q head 的槽位。
+        grid = (batch_size, num_kv_heads, num_page_splits)
+        quest_estimate_split_kernel_grouped[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_SPLITS=num_page_splits,
+            kv_group_num=kv_group_num,
+            num_warps=4,
+            num_stages=2,
+        )
+
     nvtx.range_pop()
 
 
@@ -896,6 +1342,26 @@ def quest_select_topk_pages(
     return kv_indptr, kv_indices
 
 
+def quest_select_topk_pages_grouped(
+    estimated_scores: torch.Tensor,     # [batch, num_kv_heads, max_pages]
+    seq_lens: torch.Tensor,             # [batch]
+    req_to_token: torch.Tensor,         # [batch, max_context_len]
+    quest_topk: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grouped-topk 版本：按 KV 头选择 page，并共享给同组 Q 头。
+
+    只是将 num_heads 换成 num_kv_heads，内部直接复用 quest_select_topk_pages。
+    """
+    return quest_select_topk_pages(
+        estimated_scores=estimated_scores,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        quest_topk=quest_topk,
+        page_size=page_size,
+    )
+
+
 @triton.jit
 def quest_update_metadata_kernel(
     K_new,                  # [batch, num_heads, head_dim] - 当前 step 的新 K
@@ -1074,6 +1540,41 @@ def quest_select_topk_pages_into(
         num_heads,
         BLOCK_COPY,
         ITERS,
+    )
+
+
+def quest_select_topk_pages_into_grouped(
+    estimated_scores: torch.Tensor,     # [bs, num_kv_heads, max_pages_cap]
+    seq_lens: torch.Tensor,             # [bs]
+    req_to_token: torch.Tensor,         # [bs, max_context_len]
+    quest_topk: int,
+    page_size: int,
+    selected_pages: torch.Tensor,       # prealloc [bs, num_kv_heads, quest_topk]
+    kv_indices_buf: torch.Tensor,       # prealloc [(bs*num_kv_heads), tokens_cap]
+    tokens_per_head: torch.Tensor,      # prealloc [(bs*num_kv_heads)]
+    tokens_per_batch: torch.Tensor,     # prealloc [bs]
+    kv_indptr: torch.Tensor,            # prealloc [bs+1]
+    kv_indices: torch.Tensor,           # prealloc big 1D buffer
+    num_kv_heads: int,
+):
+    """Grouped variant of quest_select_topk_pages_into using KV heads.
+
+    This thin wrapper forwards to the per-head implementation with num_heads
+    set to num_kv_heads, so the underlying Triton kernels are fully reused.
+    """
+    quest_select_topk_pages_into(
+        estimated_scores=estimated_scores,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        quest_topk=quest_topk,
+        page_size=page_size,
+        selected_pages=selected_pages,
+        kv_indices_buf=kv_indices_buf,
+        tokens_per_head=tokens_per_head,
+        tokens_per_batch=tokens_per_batch,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        num_heads=num_kv_heads,
     )
 
 def quest_update_kv_and_metadata(
