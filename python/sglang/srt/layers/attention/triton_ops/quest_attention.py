@@ -214,8 +214,9 @@ def _quest_decode_grouped_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    kv_group_num: tl.constexpr,
-    num_q_heads: tl.constexpr,
+    kv_group_num: tl.constexpr,        # = num_q_heads // num_kv_heads
+    num_q_heads: tl.constexpr,         # total Q heads (Hq)
+    num_kv_heads: tl.constexpr,        # KV heads (Hkv)
     BLOCK_DMODEL: tl.constexpr,   # padded head_dim (K dimension for QK)
     BLOCK_DV: tl.constexpr,       # padded v_head_dim (N dimension for PV)
     BLOCK_N: tl.constexpr,        # tokens per iteration in sequence dim
@@ -245,9 +246,8 @@ def _quest_decode_grouped_kernel_stage1(
     - Q:        [B, Hq, D]          (query vectors)
     - K_Buffer: [T, Hkv, D]         (key cache, shared across groups)
     - V_Buffer: [T, Hkv, Dv]        (value cache)
-    - kv_indptr: [B + 1]            (per-batch token counts, shared by all heads)
-    - kv_indices: flattened indices; for Quest layout we treat the segment of
-      the *first* Q head in each KV group as the canonical token sequence.
+    - kv_indptr: [B + 1]            (per-batch token counts per KV head)
+    - kv_indices: flattened indices over [B, Hkv, L_b] for the selected tokens.
     - Att_Out: [B, Hq, S, Dv]       (stage1 partial outputs)
     - Att_Lse: [B, Hq, S]           (per-split log-sum-exp)
 
@@ -326,15 +326,14 @@ def _quest_decode_grouped_kernel_stage1(
             other=0.0,
         )
 
-        # We only materialize the token index sequence from the first Q head
-        # in this KV group. Quest's kv_indices layout is:
-        #   kv_indices: flattened over [B, Hq, L_b]
-        # where each Q head has its own contiguous segment of length L_b.
-        # Here we take the base_head segment as the canonical one and
-        # reuse it for all Q heads in the same KV group.
-        base_head = cur_kv_head * kv_group_num  # first Q head for this KV head
+        # Per-KV-head CSR layout:
+        # kv_indices is flattened over [B, Hkv, L_b], where L_b =
+        # kv_indptr[b+1] - kv_indptr[b] is the number of selected tokens per
+        # KV head in batch b. Tokens for (b, kv_head) occupy:
+        #   [base_tokens_before * Hkv + kv_head * L_b ... + L_b)
+        # where base_tokens_before = kv_indptr[b].
         base_tokens_before = cur_batch_token_start  # starting offset (per-batch)
-        base = base_tokens_before * num_q_heads + base_head * cur_batch_seq_len
+        base = base_tokens_before * num_kv_heads + cur_kv_head * cur_batch_seq_len
 
         # Iterate over tokens in this split with BLOCK_N granularity
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
@@ -590,11 +589,13 @@ def quest_decode_attention_fwd(
         if layer_id == 0:
             nvtx.range_pop()
     else:
-        # Strong GQA: grouped kernel，一次处理一个 KV head 对应的 kv_group_num 个 Q heads
-        # We follow decode_attention._decode_grouped_att_m_fwd:
-        # - Head dimension is blocked with BLOCK_H Q heads per CTA
-        # - grid_y = cdiv(Hq, min(BLOCK_H, kv_group_num))
-        #   so that all Q heads are covered.
+        # Strong GQA: grouped kernel，一次处理一个 KV head 对应的 kv_group_num 个 Q heads。
+        # 我们按 decode_attention._decode_grouped_att_m_fwd 的方式在 head 维做 tile：
+        # - head_num = Hq
+        # - BLOCK_H = 16 Q heads per CTA
+        # - grid_y = ceil(Hq / min(BLOCK_H, kv_group_num))
+        # CSR layout 在强 GQA 下是 per-KV-head 的：kv_indices 展开为 [B, Hkv, L_b]。
+        num_kv_heads = k_buffer.shape[1]
         BLOCK_H = 16
         grid = (
             batch,
@@ -623,6 +624,7 @@ def quest_decode_attention_fwd(
             attn_logits.stride(2),
             kv_group_num=kv_group_num,
             num_q_heads=head_num,
+            num_kv_heads=num_kv_heads,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DV=BLOCK_DV,
             BLOCK_N=BLOCK,
@@ -855,7 +857,7 @@ def quest_estimate_split_kernel_grouped(
     Q,                      # [batch, num_q_heads, head_dim]
     K_metadata,             # [num_pages, num_kv_heads, head_dim, 2]
     Seq_lens,               # [batch]
-    Estimated_scores,       # Output: [batch, num_q_heads, max_pages]
+    Estimated_scores,       # Output: [batch, num_kv_heads, max_pages]
     Req_to_token,           # [batch, max_context_len]
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -887,7 +889,7 @@ def quest_estimate_split_kernel_grouped(
     - Q:                [B, Hq, D]
     - K_metadata:       [num_pages_global, Hkv, D, 2]
     - Seq_lens:         [B]
-    - Estimated_scores: [B, Hq, max_pages]  （按 Q head 存储，组内 head 共享同一值）
+    - Estimated_scores: [B, Hkv, max_pages]  （按 KV head 存储，每个 KV 组一条曲线）
     - Req_to_token:     [B, max_context_len]
 
     注意：
@@ -944,7 +946,7 @@ def quest_estimate_split_kernel_grouped(
         group_score = tl.zeros((), dtype=tl.float32)
 
         # kv_group_num 是 constexpr，循环会被 Triton 展开：
-        # 对于每个组内 head：
+        # 对于每个组内 Q head：
         for g in range(kv_group_num):
             # 该组内 Q head 的全局索引 h_q
             hq = kv_hid * kv_group_num + g
@@ -964,20 +966,18 @@ def quest_estimate_split_kernel_grouped(
 
             group_score += score_i
 
-        # 将 group_score 写回到该 KV 组内所有 Q heads 的 Estimated_scores 槽位
-        for g in range(kv_group_num):
-            hq = kv_hid * kv_group_num + g
-            tl.store(
-                Estimated_scores + bid * stride_sb + hq * stride_sh + pid,
-                group_score,
-            )
+        # 将 group_score 写回到该 KV 组的 Estimated_scores 槽位（不再按 Q head 扩展）
+        tl.store(
+            Estimated_scores + bid * stride_sb + kv_hid * stride_sh + pid,
+            group_score,
+        )
 
 
 def quest_estimate_scores(
     q: torch.Tensor,                    # [B, Hq, D]
     k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
     seq_lens: torch.Tensor,             # [B]
-    estimated_scores: torch.Tensor,     # [B, Hq, max_pages]
+    estimated_scores: torch.Tensor,     # weak: [B, Hq, max_pages], strong: [B, Hkv, max_pages]
     page_size: int,
     req_to_token: torch.Tensor,         # [B, max_context_len]
     num_page_splits: int,
@@ -1034,8 +1034,9 @@ def quest_estimate_scores(
             num_stages=2,
         )
     else:
-        # 强 GQA：按 KV head 维度并行，在 kernel 内对组内所有 Q heads 做 score
-        # 的 group-reduction，并将 group score 回写到每个 Q head 的槽位。
+        # 强 GQA：estimated_scores 视为 [B, Hkv, max_pages]，按 KV head 维度并行，在
+        # kernel 内对组内所有 Q heads 做 score 的 group-reduction，并将 group score
+        # 存入对应的 KV 组槽位（不再扩展到 Q heads）。
         grid = (batch_size, num_kv_heads, num_page_splits)
         quest_estimate_split_kernel_grouped[grid](
             q,

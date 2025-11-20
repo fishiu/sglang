@@ -53,7 +53,9 @@ class QuestAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.quest_attention import (
             quest_estimate_scores,
             quest_select_topk_pages,
+            quest_select_topk_pages_grouped,
             quest_select_topk_pages_into,
+            quest_select_topk_pages_into_grouped,
             quest_update_kv_and_metadata,
             quest_compute_extend_metadata,
             quest_decode_attention_fwd,
@@ -62,7 +64,9 @@ class QuestAttnBackend(AttentionBackend):
         
         self.quest_estimate_scores = quest_estimate_scores
         self.quest_select_topk_pages = quest_select_topk_pages
+        self.quest_select_topk_pages_grouped = quest_select_topk_pages_grouped
         self.quest_select_topk_pages_into = quest_select_topk_pages_into
+        self.quest_select_topk_pages_into_grouped = quest_select_topk_pages_into_grouped
         self.quest_update_kv_and_metadata = quest_update_kv_and_metadata
         self.quest_compute_extend_metadata = quest_compute_extend_metadata
         self.quest_decode_attention_fwd = quest_decode_attention_fwd
@@ -265,31 +269,52 @@ class QuestAttnBackend(AttentionBackend):
             # Step 2: Estimate - 估算 page-level 注意力得分
             nvtx.range_push("quest_estimate_scores")
             q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            if use_weak:
+                # Weak GQA / MHA: estimate per Q head -> [B, Hq, max_pages]
+                est_buf = self.estimated_scores
+                grouped_flag = False
+            else:
+                # Strong GQA: estimate per KV head -> [B, Hkv, max_pages]
+                est_buf = self.estimated_scores[:, : self.num_kv_head, :]
+                grouped_flag = True
+
             self.quest_estimate_scores(
                 q=q_3d,
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 seq_lens=forward_batch.seq_lens,
-                estimated_scores=self.estimated_scores,
+                estimated_scores=est_buf,
                 page_size=self.page_size,
                 req_to_token=forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices
                 ],
                 num_page_splits=self.estimate_splits,
-                grouped=not use_weak,
+                grouped=grouped_flag,
             )
             nvtx.range_pop()
 
             # Step 3: TopK Selection - 选择重要 pages
             nvtx.range_push("quest_select_topk_pages")
-            kv_indptr, kv_indices = self.quest_select_topk_pages(
-                estimated_scores=self.estimated_scores,
-                seq_lens=forward_batch.seq_lens,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices
-                ],
-                quest_topk=self.quest_topk,
-                page_size=self.page_size,
-            )
+            if use_weak:
+                kv_indptr, kv_indices = self.quest_select_topk_pages(
+                    estimated_scores=est_buf,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices
+                    ],
+                    quest_topk=self.quest_topk,
+                    page_size=self.page_size,
+                )
+            else:
+                # Strong GQA: TopK per KV head using grouped wrapper
+                kv_indptr, kv_indices = self.quest_select_topk_pages_grouped(
+                    estimated_scores=est_buf,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices
+                    ],
+                    quest_topk=self.quest_topk,
+                    page_size=self.page_size,
+                )
             nvtx.range_pop()
             attn_logits = self.attn_logits
             attn_lse = self.attn_lse
@@ -326,13 +351,24 @@ class QuestAttnBackend(AttentionBackend):
             # - If using page-parallel kernel, keep the pages_cap view to reduce empty CTAs.
             pages_cap = getattr(self, "_cg_estimate_pages", None)
             if self.estimate_splits is not None and self.estimate_splits > 0:
-                est_buf = self.cuda_graph_estimated_scores[: forward_batch.batch_size]
+                # For split-kernel we must pass the full buffer in page dim.
+                if use_weak:
+                    est_buf = self.cuda_graph_estimated_scores[: forward_batch.batch_size]
+                else:
+                    est_buf = self.cuda_graph_estimated_scores[
+                        : forward_batch.batch_size, : self.num_kv_head
+                    ]
             else:
                 if pages_cap is None:
                     pages_cap = (self.max_context_len + self.page_size - 1) // self.page_size
-                est_buf = self.cuda_graph_estimated_scores[
-                    : forward_batch.batch_size, :, : pages_cap
-                ]
+                if use_weak:
+                    est_buf = self.cuda_graph_estimated_scores[
+                        : forward_batch.batch_size, :, : pages_cap
+                    ]
+                else:
+                    est_buf = self.cuda_graph_estimated_scores[
+                        : forward_batch.batch_size, : self.num_kv_head, : pages_cap
+                    ]
 
             self.quest_estimate_scores(
                 q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -352,22 +388,46 @@ class QuestAttnBackend(AttentionBackend):
             nvtx.range_push("quest_select_expand_pack")
             bs_now = forward_batch.batch_size
             kv_indptr.zero_()
-            self.quest_select_topk_pages_into(
-                estimated_scores=est_buf,
-                seq_lens=forward_batch.seq_lens,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices
-                ],
-                quest_topk=self.quest_topk,
-                page_size=self.page_size,
-                selected_pages=self.cuda_graph_selected_pages[:bs_now],
-                kv_indices_buf=self.cuda_graph_kv_indices_buf[: bs_now * self.num_head],
-                tokens_per_head=self.cuda_graph_tokens_per_head[: bs_now * self.num_head],
-                tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
-                kv_indptr=kv_indptr[: bs_now + 1],
-                kv_indices=kv_indices,
-                num_heads=self.num_head,
-            )
+            if use_weak:
+                # Weak GQA / MHA: per-Q-head select/expand/pack
+                self.quest_select_topk_pages_into(
+                    estimated_scores=est_buf,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices
+                    ],
+                    quest_topk=self.quest_topk,
+                    page_size=self.page_size,
+                    selected_pages=self.cuda_graph_selected_pages[:bs_now],
+                    kv_indices_buf=self.cuda_graph_kv_indices_buf[: bs_now * self.num_head],
+                    tokens_per_head=self.cuda_graph_tokens_per_head[: bs_now * self.num_head],
+                    tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
+                    kv_indptr=kv_indptr[: bs_now + 1],
+                    kv_indices=kv_indices,
+                    num_heads=self.num_head,
+                )
+            else:
+                # Strong GQA: per-KV-head select/expand/pack，使用 grouped wrapper。
+                self.quest_select_topk_pages_into_grouped(
+                    estimated_scores=est_buf,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices
+                    ],
+                    quest_topk=self.quest_topk,
+                    page_size=self.page_size,
+                    selected_pages=self.cuda_graph_selected_pages[:bs_now, : self.num_kv_head],
+                    kv_indices_buf=self.cuda_graph_kv_indices_buf[
+                        : bs_now * self.num_kv_head
+                    ],
+                    tokens_per_head=self.cuda_graph_tokens_per_head[
+                        : bs_now * self.num_kv_head
+                    ],
+                    tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
+                    kv_indptr=kv_indptr[: bs_now + 1],
+                    kv_indices=kv_indices,
+                    num_kv_heads=self.num_kv_head,
+                )
             if num_kv_splits is not None:
                 num_kv_splits[:bs_now].fill_(self.max_kv_splits)
             nvtx.range_pop()
