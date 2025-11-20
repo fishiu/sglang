@@ -767,6 +767,7 @@ def quest_estimate_split_kernel(
     Seq_lens,               # [batch]
     Estimated_scores,       # Output: [batch, num_q_heads, max_pages]
     Req_to_token,           # [batch, max_context_len]
+    Req_pool_indices,       # [batch] mapping to rows in Req_to_token pool
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qb,
@@ -778,6 +779,7 @@ def quest_estimate_split_kernel(
     stride_sb,
     stride_sh,
     stride_rb,
+    stride_rp,
     BLOCK_DMODEL: tl.constexpr,
     NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
     kv_group_num: tl.constexpr,   # = num_q_heads // num_kv_heads
@@ -823,7 +825,10 @@ def quest_estimate_split_kernel(
     for pid in range(split_start, split_end):
         # 通过 req_to_token 获得全局 page id
         token_offset_in_seq = pid * page_size
-        global_token_idx = tl.load(Req_to_token + bid * stride_rb + token_offset_in_seq)
+        pool_row = tl.load(Req_pool_indices + bid)
+        global_token_idx = tl.load(
+            Req_to_token + pool_row * stride_rb + token_offset_in_seq
+        )
         global_page_idx = global_token_idx // page_size
 
         # 加载该 page 的 metadata（注意 GQA：Q 头映射到 KV 头）
@@ -858,7 +863,8 @@ def quest_estimate_split_kernel_grouped(
     K_metadata,             # [num_pages, num_kv_heads, head_dim, 2]
     Seq_lens,               # [batch]
     Estimated_scores,       # Output: [batch, num_kv_heads, max_pages]
-    Req_to_token,           # [batch, max_context_len]
+    Req_to_token,           # [max_pool, max_context_len]
+    Req_pool_indices,       # [batch] mapping to rows in Req_to_token pool
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qb,
@@ -870,6 +876,7 @@ def quest_estimate_split_kernel_grouped(
     stride_sb,
     stride_sh,
     stride_rb,
+    stride_rp,
     BLOCK_DMODEL: tl.constexpr,
     NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
     kv_group_num: tl.constexpr,   # = num_q_heads // num_kv_heads
@@ -919,7 +926,10 @@ def quest_estimate_split_kernel_grouped(
     for pid in range(split_start, split_end):
         # 通过 req_to_token 获得全局 page id
         token_offset_in_seq = pid * page_size
-        global_token_idx = tl.load(Req_to_token + bid * stride_rb + token_offset_in_seq)
+        pool_row = tl.load(Req_pool_indices + bid)
+        global_token_idx = tl.load(
+            Req_to_token + pool_row * stride_rb + token_offset_in_seq
+        )
         global_page_idx = global_token_idx // page_size
 
         # 加载该 page 的 metadata（按 KV head 维度）
@@ -979,7 +989,8 @@ def quest_estimate_scores(
     seq_lens: torch.Tensor,             # [B]
     estimated_scores: torch.Tensor,     # weak: [B, Hq, max_pages], strong: [B, Hkv, max_pages]
     page_size: int,
-    req_to_token: torch.Tensor,         # [B, max_context_len]
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [B]
     num_page_splits: int,
     grouped: bool = False,              # 是否在 KV 组上做 score 的 group-reduction
     debug: bool = False,                # CPU 验证
@@ -1016,6 +1027,7 @@ def quest_estimate_scores(
             seq_lens,
             estimated_scores,
             req_to_token,
+            req_pool_indices,
             page_size,
             head_dim,
             q.stride(0),
@@ -1027,6 +1039,7 @@ def quest_estimate_scores(
             estimated_scores.stride(0),
             estimated_scores.stride(1),
             req_to_token.stride(0),
+            req_pool_indices.stride(0),
             BLOCK_DMODEL=BLOCK_DMODEL,
             NUM_SPLITS=num_page_splits,
             kv_group_num=kv_group_num,
@@ -1044,6 +1057,7 @@ def quest_estimate_scores(
             seq_lens,
             estimated_scores,
             req_to_token,
+            req_pool_indices,
             page_size,
             head_dim,
             q.stride(0),
@@ -1055,6 +1069,7 @@ def quest_estimate_scores(
             estimated_scores.stride(0),
             estimated_scores.stride(1),
             req_to_token.stride(0),
+            req_pool_indices.stride(0),
             BLOCK_DMODEL=BLOCK_DMODEL,
             NUM_SPLITS=num_page_splits,
             kv_group_num=kv_group_num,
@@ -1121,12 +1136,14 @@ def quest_select_topk_kernel(
 def quest_expand_pages_to_csr_kernel(
     selected_pages_ptr,         # [bsz, num_heads, quest_topk]
     seq_lens_ptr,               # [bsz]
-    req_to_token_ptr,           # [bsz, max_seq_len]
+    req_to_token_ptr,           # [max_pool, max_seq_len]
+    req_pool_indices_ptr,       # [bsz]
     kv_indices_ptr,             # output [bsz * num_heads, tokens_cap]
     tokens_per_head_ptr,        # output [bsz * num_heads]
     stride_sel_b,               # 340
     stride_sel_h,               # 17
     stride_rt_b: tl.constexpr,  # 32772
+    stride_rp: tl.constexpr,    # 1
     stride_rt_pos: tl.constexpr,# 1
     tokens_cap: tl.constexpr,   # 272
     BLOCK_TOKENS: tl.constexpr, # 512
@@ -1144,6 +1161,7 @@ def quest_expand_pages_to_csr_kernel(
     ps = tl.full((), page_size, dtype=tl.int32)  # 16
     one = tl.full((), 1, dtype=tl.int32)  # 1
     num_pages = (seq_len + ps - one) // ps  # (501+16-1)//16=32
+    pool_row = tl.load(req_pool_indices_ptr + batch_idx)
 
     selected_base = selected_pages_ptr + batch_idx * stride_sel_b + head_idx * stride_sel_h  # ptr + 0 * 340 + 0 * 17 = ptr + 0
     indices_base = kv_indices_ptr + (batch_idx * num_heads + head_idx) * stride_idx_h  # ptr + (0*20+0)*1 = ptr + 0
@@ -1173,7 +1191,7 @@ def quest_expand_pages_to_csr_kernel(
         # map logical position to physical token id via req_to_token
         logical_pos = start + token_offsets  # [192, 193, 194, ..., 207]
         phys_ids = tl.load(
-            req_to_token_ptr + batch_idx * stride_rt_b + logical_pos * stride_rt_pos,  # ptr + 0 * 32772 + logical_pos * 1
+            req_to_token_ptr + pool_row * stride_rt_b + logical_pos * stride_rt_pos,
             mask=mask_token,
             other=0,
         )
@@ -1230,7 +1248,8 @@ def quest_pack_kv_indices_kernel(
 def quest_select_topk_pages(
     estimated_scores: torch.Tensor,     # [batch, num_heads, max_pages]
     seq_lens: torch.Tensor,             # [batch]
-    req_to_token: torch.Tensor,         # [batch, max_context_len]
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [batch]
     quest_topk: int,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1279,11 +1298,13 @@ def quest_select_topk_pages(
         selected_pages,
         seq_lens,
         req_to_token,
+        req_pool_indices,
         kv_indices_buf,
         tokens_per_head,
         selected_pages.stride(0),
         selected_pages.stride(1),
         stride_rt_b=req_to_token.stride(0),
+        stride_rp=req_pool_indices.stride(0),
         stride_rt_pos=req_to_token.stride(1),
         tokens_cap=tokens_cap,
         BLOCK_TOKENS=BLOCK_TOKENS,
@@ -1346,7 +1367,8 @@ def quest_select_topk_pages(
 def quest_select_topk_pages_grouped(
     estimated_scores: torch.Tensor,     # [batch, num_kv_heads, max_pages]
     seq_lens: torch.Tensor,             # [batch]
-    req_to_token: torch.Tensor,         # [batch, max_context_len]
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [batch]
     quest_topk: int,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1358,6 +1380,7 @@ def quest_select_topk_pages_grouped(
         estimated_scores=estimated_scores,
         seq_lens=seq_lens,
         req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
         quest_topk=quest_topk,
         page_size=page_size,
     )
@@ -1453,7 +1476,8 @@ def quest_min_tokens_per_batch_kernel(
 def quest_select_topk_pages_into(
     estimated_scores: torch.Tensor,     # [bs, num_heads, max_pages_cap]
     seq_lens: torch.Tensor,             # [bs]
-    req_to_token: torch.Tensor,         # [bs, max_context_len]
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [bs]
     quest_topk: int,
     page_size: int,
     selected_pages: torch.Tensor,       # prealloc [bs, num_heads, quest_topk]
@@ -1495,11 +1519,13 @@ def quest_select_topk_pages_into(
         selected_pages,
         seq_lens,
         req_to_token,
+        req_pool_indices,
         kv_indices_buf,
         tokens_per_head,
         selected_pages.stride(0),
         selected_pages.stride(1),
         stride_rt_b=req_to_token.stride(0),
+        stride_rp=req_pool_indices.stride(0),
         stride_rt_pos=req_to_token.stride(1),
         tokens_cap=tokens_cap,
         BLOCK_TOKENS=BLOCK_TOKENS,
@@ -1547,7 +1573,8 @@ def quest_select_topk_pages_into(
 def quest_select_topk_pages_into_grouped(
     estimated_scores: torch.Tensor,     # [bs, num_kv_heads, max_pages_cap]
     seq_lens: torch.Tensor,             # [bs]
-    req_to_token: torch.Tensor,         # [bs, max_context_len]
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [bs]
     quest_topk: int,
     page_size: int,
     selected_pages: torch.Tensor,       # prealloc [bs, num_kv_heads, quest_topk]
@@ -1567,6 +1594,7 @@ def quest_select_topk_pages_into_grouped(
         estimated_scores=estimated_scores,
         seq_lens=seq_lens,
         req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
         quest_topk=quest_topk,
         page_size=page_size,
         selected_pages=selected_pages,

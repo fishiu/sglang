@@ -269,6 +269,8 @@ class QuestAttnBackend(AttentionBackend):
             # Step 2: Estimate - 估算 page-level 注意力得分
             nvtx.range_push("quest_estimate_scores")
             q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            req_to_token_pool = forward_batch.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices
             if use_weak:
                 # Weak GQA / MHA: estimate per Q head -> [B, Hq, max_pages]
                 est_buf = self.estimated_scores
@@ -284,9 +286,8 @@ class QuestAttnBackend(AttentionBackend):
                 seq_lens=forward_batch.seq_lens,
                 estimated_scores=est_buf,
                 page_size=self.page_size,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices
-                ],
+                req_to_token=req_to_token_pool,
+                req_pool_indices=req_pool_indices,
                 num_page_splits=self.estimate_splits,
                 grouped=grouped_flag,
             )
@@ -309,9 +310,8 @@ class QuestAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = self.quest_select_topk_pages_grouped(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices
-                    ],
+                    req_to_token=req_to_token_pool,
+                    req_pool_indices=req_pool_indices,
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
                 )
@@ -376,9 +376,8 @@ class QuestAttnBackend(AttentionBackend):
                 seq_lens=forward_batch.seq_lens,
                 estimated_scores=est_buf,
                 page_size=self.page_size,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices
-                ],
+                req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
                 num_page_splits=self.estimate_splits,
                 grouped=not use_weak,
             )
@@ -393,9 +392,8 @@ class QuestAttnBackend(AttentionBackend):
                 self.quest_select_topk_pages_into(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices
-                    ],
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
                     selected_pages=self.cuda_graph_selected_pages[:bs_now],
@@ -411,9 +409,8 @@ class QuestAttnBackend(AttentionBackend):
                 self.quest_select_topk_pages_into_grouped(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices
-                    ],
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
                     selected_pages=self.cuda_graph_selected_pages[:bs_now, : self.num_kv_head],
