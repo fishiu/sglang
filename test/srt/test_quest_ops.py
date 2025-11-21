@@ -72,6 +72,8 @@ class TestQuestOps(CustomTestCase):
         max_ctx = max_pages * page_size
         req_to_token = torch.arange(max_ctx, device=device, dtype=torch.int32).repeat(B, 1)
 
+        # For tests, req_pool_indices is just arange(B)
+        req_pool_indices = torch.arange(B, device=device, dtype=torch.int32)
         quest_estimate_scores(
             q,
             k_meta,
@@ -79,6 +81,8 @@ class TestQuestOps(CustomTestCase):
             estimated_scores,
             page_size,
             req_to_token,
+            req_pool_indices,
+            num_page_splits=1,
         )
 
         for b in range(B):
@@ -108,10 +112,12 @@ class TestQuestOps(CustomTestCase):
         kv_indptr = torch.zeros(B + 1, device=device, dtype=torch.int32)
         kv_indices = torch.empty(B * H * tokens_cap, device=device, dtype=torch.int32)
 
+        req_pool_indices = torch.arange(B, device=device, dtype=torch.int32)
         quest_select_topk_pages_into(
             estimated_scores,
             seq_lens,
             req_to_token,
+            req_pool_indices,
             quest_topk,
             page_size,
             selected_pages,
