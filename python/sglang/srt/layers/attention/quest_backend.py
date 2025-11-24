@@ -290,6 +290,7 @@ class QuestAttnBackend(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 num_page_splits=self.estimate_splits,
                 grouped=grouped_flag,
+                max_pages_to_process=self.forward_metadata["max_pages"],
             )
             nvtx.range_pop()
 
@@ -380,6 +381,7 @@ class QuestAttnBackend(AttentionBackend):
                 req_pool_indices=forward_batch.req_pool_indices,
                 num_page_splits=self.estimate_splits,
                 grouped=not use_weak,
+                max_pages_to_process=pages_cap,
             )
             nvtx.range_pop()
 

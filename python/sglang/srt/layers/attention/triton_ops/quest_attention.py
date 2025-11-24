@@ -947,6 +947,85 @@ def quest_estimate_split_kernel_grouped(
         )
 
 
+@torch.compile
+def _quest_estimate_torch_impl(
+    q,
+    k_metadata,
+    req_to_token,
+    req_pool_indices,
+    seq_lens,
+    page_size: int,
+    max_pages_process: int,
+    kv_group_num: int,
+    grouped: bool,
+):
+    B, Hq, D = q.shape
+    Hkv = k_metadata.shape[1]
+
+    # 1. Prepare indices
+    # [1, P]
+    page_offsets = (
+        torch.arange(max_pages_process, device=q.device).unsqueeze(0) * page_size
+    )
+    # [B, 1]
+    pool_indices = req_pool_indices.unsqueeze(1)
+
+    # Gather global token IDs: [B, P]
+    # req_to_token is [PoolSize, MaxLen]
+    global_token_ids = req_to_token[pool_indices, page_offsets]
+    global_page_ids = global_token_ids // page_size
+
+    # 2. Gather K metadata
+    # [B, P, Hkv, D, 2]
+    k_data = k_metadata[global_page_ids]
+
+    # 3. Compute Score
+    # q: [B, Hkv, G, D]
+    q_reshaped = q.view(B, Hkv, kv_group_num, D)
+
+    # Broadcast shapes:
+    # q: [B, 1, Hkv, G, D]
+    # k: [B, P, Hkv, 1, D]
+    q_b = q_reshaped.unsqueeze(1)
+    k_min = k_data[..., 0].unsqueeze(3)
+    k_max = k_data[..., 1].unsqueeze(3)
+
+    # Optimization: select min/max based on sign of q
+    # If q > 0, we want k_max. If q < 0, we want k_min.
+    k_target = torch.where(q_b > 0, k_max, k_min)
+
+    # [B, P, Hkv, G, D] -> sum over D -> [B, P, Hkv, G]
+    scores_g = torch.sum(q_b * k_target, dim=-1)
+
+    # 4. Handle grouping
+    if grouped:
+        # Sum over groups: [B, P, Hkv]
+        scores = torch.sum(scores_g, dim=-1)
+        # [B, Hkv, P]
+        scores = scores.permute(0, 2, 1)
+    else:
+        # Flatten groups to heads: [B, P, Hq]
+        scores = scores_g.flatten(2, 3)
+        # [B, Hq, P]
+        scores = scores.permute(0, 2, 1)
+
+    # 5. Mask invalid pages
+    # valid range: 0 .. num_pages - 2 (inclusive)
+    num_pages = (seq_lens + page_size - 1) // page_size
+    # [B, 1]
+    valid_limit = (num_pages - 1).unsqueeze(1)
+    # [1, P]
+    page_indices = torch.arange(max_pages_process, device=q.device).unsqueeze(0)
+
+    # [B, P] -> [B, 1, P]
+    mask = (page_indices < valid_limit).unsqueeze(1)
+
+    # Apply mask (fill 0.0)
+    scores = torch.where(mask, scores, torch.zeros_like(scores))
+
+    return scores
+
+
 def quest_estimate_scores(
     q: torch.Tensor,                    # [B, Hq, D]
     k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
@@ -958,6 +1037,7 @@ def quest_estimate_scores(
     num_page_splits: int,
     grouped: bool = False,              # 是否在 KV 组上做 score 的 group-reduction
     debug: bool = False,                # CPU 验证
+    max_pages_to_process: int | None = None,
 ):
     """
     Python 封装：估算 page-level 注意力得分
@@ -965,81 +1045,46 @@ def quest_estimate_scores(
     输出 estimated_scores 中，最后一个 page 的得分保持为 0（不参与 TopK）
     """
     batch_size, num_q_heads, head_dim = q.shape
-    max_pages = estimated_scores.shape[-1]
-
-    # 计算 grid 和 block 配置（head_dim 向上取 2 的幂，方便 Triton 向量化）
-    BLOCK_DMODEL = triton.next_power_of_2(head_dim)
-
-    # Splits 配置：固定 NUM_SPLITS，kernel 内部循环 pages。
-    # num_page_splits 是一个较小的常数（如 8/16/32），用于在 page 维做粗
-    # 粒度切分，避免单个 program 处理过长的 page 区间。
-    if num_page_splits is None or num_page_splits <= 0:
-        num_page_splits = 1
-
+    
     # GQA: map Q heads to KV heads via kv_group_num
     num_kv_heads = k_metadata.shape[1]
     assert num_q_heads % num_kv_heads == 0, "Invalid GQA config: Hq must be multiple of Hkv"
     kv_group_num = num_q_heads // num_kv_heads
-    nvtx.range_push("quest_estimate_kernel_splits")
 
-    if not grouped or kv_group_num == 1:
-        # 弱 GQA / MHA：直接按 Q head 维度并行，每个 head 独立估计 page scores。
-        grid = (batch_size, num_q_heads, num_page_splits)
-        quest_estimate_split_kernel[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            req_pool_indices,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            req_pool_indices.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            NUM_SPLITS=num_page_splits,
-            kv_group_num=kv_group_num,
-            num_warps=4,
-            num_stages=2,
-        )
+    if max_pages_to_process is None:
+        # Calculate effective max pages to avoid wasted compute
+        # Syncing max seq len is cheap compared to running computation on padded pages
+        if batch_size > 0:
+            max_seq_len = seq_lens.max().item()
+            max_effective_pages = (max_seq_len + page_size - 1) // page_size
+        else:
+            max_effective_pages = 0
     else:
-        # 强 GQA：estimated_scores 视为 [B, Hkv, max_pages]，按 KV head 维度并行，在
-        # kernel 内对组内所有 Q heads 做 score 的 group-reduction，并将 group score
-        # 存入对应的 KV 组槽位（不再扩展到 Q heads）。
-        grid = (batch_size, num_kv_heads, num_page_splits)
-        quest_estimate_split_kernel_grouped[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            req_pool_indices,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            req_pool_indices.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            NUM_SPLITS=num_page_splits,
-            kv_group_num=kv_group_num,
-            num_warps=4,
-            num_stages=2,
-        )
+        max_effective_pages = max_pages_to_process
+    
+    # Clamp to output capacity
+    max_pages_out = estimated_scores.shape[-1]
+    process_pages = min(max_effective_pages, max_pages_out)
+    
+    if process_pages <= 0:
+        return
+
+    nvtx.range_push("quest_estimate_torch")
+
+    scores = _quest_estimate_torch_impl(
+        q,
+        k_metadata,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        page_size,
+        process_pages,
+        kv_group_num,
+        grouped
+    )
+    
+    # Write back results
+    estimated_scores[:, :, :process_pages].copy_(scores)
 
     nvtx.range_pop()
 
