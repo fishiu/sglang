@@ -39,7 +39,6 @@ def _quest_decode_kernel_stage1(
     Att_Out,            # [batch, num_heads, max_kv_splits, v_head_dim]
     Att_Lse,            # [batch, num_heads, max_kv_splits]
     num_kv_splits,      # [batch]
-    Debug_Info,         # [batch, num_heads, max_kv_splits, 5] - debug info
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -97,17 +96,7 @@ def _quest_decode_kernel_stage1(
     )  # div(div(257, 8), 16)*16=48 很浪费就差一点点就32了
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    
-    # # Calculate loop iterations for debugging
-    # loop_iters = tl.cdiv(tl.maximum(split_kv_end - split_kv_start, 0), BLOCK_N)
-    
-    # # Store debug info: [cur_batch_seq_len, kv_len_per_split, split_kv_start, split_kv_end, loop_iters]
-    # debug_offset = cur_batch * (head_num * MAX_KV_SPLITS * 5) + cur_head * (MAX_KV_SPLITS * 5) + split_kv_id * 5
-    # tl.store(Debug_Info + debug_offset + 0, cur_batch_seq_len)
-    # tl.store(Debug_Info + debug_offset + 1, kv_len_per_split)
-    # tl.store(Debug_Info + debug_offset + 2, split_kv_start)
-    # tl.store(Debug_Info + debug_offset + 3, split_kv_end)
-    # tl.store(Debug_Info + debug_offset + 4, loop_iters)
+
     
     # 初始化 online softmax 变量
     e_max = -float("inf")
@@ -542,13 +531,6 @@ def quest_decode_attention_fwd(
         grid = (batch, head_num, MAX_KV_SPLITS)
         num_warps = 4
 
-        # Create debug info tensor: [batch, num_heads, max_kv_splits, 5]
-        debug_info = torch.zeros(
-            (batch, head_num, MAX_KV_SPLITS, 5),
-            dtype=torch.int32,
-            device=q.device,
-        )
-
         if layer_id == 0:
             nvtx.range_push("quest_attnl0")
 
@@ -562,7 +544,6 @@ def quest_decode_attention_fwd(
             attn_logits,
             attn_lse,
             num_kv_splits,
-            debug_info,
             q.stride(0),
             q.stride(1),
             k_buffer.stride(0),
@@ -634,23 +615,6 @@ def quest_decode_attention_fwd(
             Lk=Lk,
             Lv=Lv,
         )
-        
-    # # Print debug info in a readable format
-    # print("\n" + "="*80)
-    # print(f"DEBUG INFO - Grid: {grid}")
-    # print("="*80)
-    # debug_cpu = debug_info.cpu()
-    # for b in range(batch):
-    #     for h in range(head_num):
-    #         print(f"\n[Batch {b}, Head {h}]")
-    #         print(f"  {'Split':<8} {'SeqLen':<10} {'LenPerSplit':<15} {'Start':<10} {'End':<10} {'LoopIters':<10}")
-    #         print(f"  {'-'*8} {'-'*10} {'-'*15} {'-'*10} {'-'*10} {'-'*10}")
-    #         for s in range(MAX_KV_SPLITS):
-    #             info = debug_cpu[b, h, s]
-    #             seq_len, len_per_split, start, end, loop_iters = info[0].item(), info[1].item(), info[2].item(), info[3].item(), info[4].item()
-    #             if seq_len > 0:  # Only print if valid
-    #                 print(f"  {s:<8} {seq_len:<10} {len_per_split:<15} {start:<10} {end:<10} {loop_iters:<10}")
-    # print("="*80 + "\n")
     
     # Stage2: 聚合结果
     grid = (batch, head_num)
@@ -1196,8 +1160,6 @@ def quest_expand_pages_to_csr_kernel(
             other=0,
         )
         tl.store(indices_base + lane_offsets, phys_ids, mask=mask_ptr)
-
-        # no debug writes
 
         write_offset += length
 
