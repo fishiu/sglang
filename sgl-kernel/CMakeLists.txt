@@ -406,10 +406,32 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
+
+# only numa related environment variables are set for mscclpp
+if(DEFINED ENV{CONDA_PREFIX})
+    # set env variable to find numa in conda environment
+    set(ENV{PKG_CONFIG_PATH} "$ENV{CONDA_PREFIX}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+    
+    # temporary save current CMAKE_PREFIX_PATH
+    set(ORIGINAL_CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH})
+    
+    # add search path for mscclpp
+    list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+    
+    # set NUMA related variables for mscclpp
+    set(NUMA_ROOT "$ENV{CONDA_PREFIX}")
+    set(ENV{NUMA_ROOT} "$ENV{CONDA_PREFIX}")
+endif()
+
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
+
+# restore original CMAKE_PREFIX_PATH if it was modified
+if(DEFINED ORIGINAL_CMAKE_PREFIX_PATH)
+    set(CMAKE_PREFIX_PATH ${ORIGINAL_CMAKE_PREFIX_PATH})
+endif()
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
