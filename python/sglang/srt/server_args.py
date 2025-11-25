@@ -341,7 +341,8 @@ class ServerArgs:
                     self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 4096
-        assert self.chunked_prefill_size % self.page_size == 0
+        if self.chunked_prefill_size != -1:
+            assert self.chunked_prefill_size % self.page_size == 0
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
