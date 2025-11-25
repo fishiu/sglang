@@ -55,6 +55,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.cuda.nvtx as nvtx
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
@@ -373,6 +374,8 @@ def latency_test_run_once(
         )
         profiler.start()
 
+    nvtx.range_push("bench")
+
     # Prefill
     synchronize(device)
     tic = time.perf_counter()
@@ -402,6 +405,8 @@ def latency_test_run_once(
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+    
+    nvtx.range_pop()
 
     if profile:
         profiler.stop()
