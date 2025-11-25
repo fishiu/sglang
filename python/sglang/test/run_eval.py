@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+import requests
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
@@ -24,6 +25,15 @@ def run_eval(args):
     base_url = (
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
+
+    if args.model is None:
+        try:
+            response = requests.get(f"{base_url}/models")
+            response.raise_for_status()
+            args.model = response.json()["data"][0]["id"]
+            print(f"Inferred model: {args.model}")
+        except Exception as e:
+            print(f"Failed to infer model name: {e}. Please specify --model argument.")
 
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
@@ -60,6 +70,22 @@ def run_eval(args):
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "longbench_v2":
+        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
+
+        # Default to HuggingFace dataset, can be overridden with --dataset-path
+        data_source = args.dataset_path
+        categories = args.categories.split(",") if args.categories else None
+
+        eval_obj = LongBenchV2Eval(
+            model=args.model,
+            data_source=data_source,
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            categories=categories,
+            max_context_length=getattr(args, "max_context_length", None),
+            min_context_length=getattr(args, "min_context_length", None),
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -92,6 +118,14 @@ def run_eval(args):
     # Print results
     print(f"Total latency: {latency:.3f} s")
     print(f"Score: {metrics['score']:.3f}")
+    
+    # # Print output length statistics if available
+    # if "output_length_chars" in metrics:
+    #     print(f"\n--- Output Length Statistics ---")
+    #     print(f"Chars   - Mean: {metrics['output_length_chars']:.1f}, Std: {metrics.get('output_length_chars:std', 0):.1f}")
+    #     if "output_length_tokens_approx" in metrics:
+    #         print(f"Tokens* - Mean: {metrics['output_length_tokens_approx']:.1f}, Std: {metrics.get('output_length_tokens_approx:std', 0):.1f}")
+    #         print(f"(*Approximate: chars/4)")
 
     return metrics
 
@@ -121,6 +155,31 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    
+    # LongBench-v2 specific arguments
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="THUDM/LongBench-v2",
+        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated list of categories to evaluate for LongBench-v2",
+    )
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        help="Maximum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--min-context-length",
+        type=int,
+        help="Minimum context length in characters for LongBench-v2",
+    )
+
     args = parser.parse_args()
 
     run_eval(args)
