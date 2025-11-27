@@ -94,6 +94,10 @@ def create_triton_backend(runner):
         )
 
         return DoubleSparseAttnBackend(runner)
+    elif runner.server_args.enable_quest:
+        from sglang.srt.layers.attention.quest_backend import QuestAttnBackend
+
+        return QuestAttnBackend(runner)
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

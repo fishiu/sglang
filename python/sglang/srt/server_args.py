@@ -461,6 +461,15 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # Quest (Query-Aware Sparsity)
+    enable_quest: bool = False
+    quest_topk: int = 16  # Maximum number of pages to keep (excluding last page)
+    quest_estimate_splits: int = 8
+    # Quest GQA mode: when True, use the original per-Q-head selection ("weak" GQA).
+    # When False (default), strong GQA groups Q heads that share a KV head and lets
+    # each group jointly select pages/tokens.
+    quest_use_weak_gqa: bool = False
+
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -3257,7 +3266,33 @@ class ServerArgs:
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
-
+        # Quest (Query-Aware Sparsity)
+        parser.add_argument(
+            "--enable-quest",
+            action="store_true",
+            help="Enable Quest (Query-Aware Sparsity) for efficient long-context inference using page-level metadata.",
+        )
+        parser.add_argument(
+            "--quest-topk",
+            type=int,
+            default=ServerArgs.quest_topk,
+            help="Maximum number of pages to keep in Quest sparse attention (excluding last page). Default: 16",
+        )
+        parser.add_argument(
+            "--quest-estimate-splits",
+            type=int,
+            default=ServerArgs.quest_estimate_splits,
+            help="Triton grid size when computing estimate scores, split all pages. Default: 8",
+        )
+        parser.add_argument(
+            "--quest-use-weak-gqa",
+            action="store_true",
+            help=(
+                "Use per-Q-head selection for GQA models (weak GQA). "
+                "By default (flag off), Quest groups Q heads that share a KV head "
+                "and lets each group jointly select pages/tokens (strong GQA)."
+            ),
+        )
         # Offloading
         parser.add_argument(
             "--cpu-offload-gb",
