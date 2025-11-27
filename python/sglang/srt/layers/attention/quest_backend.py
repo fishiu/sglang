@@ -51,7 +51,8 @@ class QuestAttnBackend(AttentionBackend):
         
         # 延迟导入避免 CUDA context 初始化
         from sglang.srt.layers.attention.triton_ops.quest_attention import (
-            quest_estimate_scores,
+            quest_estimate_scores_triton,
+            quest_estimate_scores_torch,
             quest_select_topk_pages,
             quest_select_topk_pages_grouped,
             quest_select_topk_pages_into,
@@ -62,7 +63,8 @@ class QuestAttnBackend(AttentionBackend):
         )
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
         
-        self.quest_estimate_scores = quest_estimate_scores
+        self.quest_estimate_scores_triton = quest_estimate_scores_triton
+        self.quest_estimate_scores_torch = quest_estimate_scores_torch
         self.quest_select_topk_pages = quest_select_topk_pages
         self.quest_select_topk_pages_grouped = quest_select_topk_pages_grouped
         self.quest_select_topk_pages_into = quest_select_topk_pages_into
@@ -280,7 +282,7 @@ class QuestAttnBackend(AttentionBackend):
                 est_buf = self.estimated_scores[:, : self.num_kv_head, :]
                 grouped_flag = True
 
-            self.quest_estimate_scores(
+            self.quest_estimate_scores_torch(
                 q=q_3d,
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 seq_lens=forward_batch.seq_lens,
@@ -371,7 +373,7 @@ class QuestAttnBackend(AttentionBackend):
                         : forward_batch.batch_size, : self.num_kv_head, : pages_cap
                     ]
 
-            self.quest_estimate_scores(
+            self.quest_estimate_scores_torch(
                 q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
                 seq_lens=forward_batch.seq_lens,
@@ -528,13 +530,10 @@ class QuestAttnBackend(AttentionBackend):
             "num_kv_splits": self.cuda_graph_num_kv_splits[:bs],
         }
         # Precompute a tighter pages cap for estimate to reduce overlaunch in graph
-        try:
-            max_pages_cap = (int(seq_lens[:bs].max().item()) + self.page_size - 1) // self.page_size
-            global_cap = (self.max_context_len + self.page_size - 1) // self.page_size
-            self._cg_estimate_pages = min(max_pages_cap, global_cap)
-        except Exception:
-            # Fallback to global cap
-            self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        # NOTE: In capture mode, seq_lens might be dummy (e.g. 1), so we cannot rely on it
+        # to determine the max_pages_cap for the graph. We must use the global context len
+        # to ensure the graph can handle any sequence length during replay.
+        self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self._graph_meta_ready = False
 
     def init_forward_metadata_replay_cuda_graph(

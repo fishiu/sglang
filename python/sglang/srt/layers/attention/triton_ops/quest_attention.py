@@ -1026,7 +1026,105 @@ def _quest_estimate_torch_impl(
     return scores
 
 
-def quest_estimate_scores(
+def quest_estimate_scores_triton(
+    q: torch.Tensor,                    # [B, Hq, D]
+    k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
+    seq_lens: torch.Tensor,             # [B]
+    estimated_scores: torch.Tensor,     # weak: [B, Hq, max_pages], strong: [B, Hkv, max_pages]
+    page_size: int,
+    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
+    req_pool_indices: torch.Tensor,     # [B]
+    num_page_splits: int,
+    grouped: bool = False,              # 是否在 KV 组上做 score 的 group-reduction
+    debug: bool = False,                # CPU 验证
+    max_pages_to_process: int | None = None,
+):
+    """
+    Python 封装：估算 page-level 注意力得分
+    
+    输出 estimated_scores 中，最后一个 page 的得分保持为 0（不参与 TopK）
+    """
+    batch_size, num_q_heads, head_dim = q.shape
+    max_pages = estimated_scores.shape[-1]
+
+    # 计算 grid 和 block 配置（head_dim 向上取 2 的幂，方便 Triton 向量化）
+    BLOCK_DMODEL = triton.next_power_of_2(head_dim)
+
+    # Splits 配置：固定 NUM_SPLITS，kernel 内部循环 pages。
+    # num_page_splits 是一个较小的常数（如 8/16/32），用于在 page 维做粗
+    # 粒度切分，避免单个 program 处理过长的 page 区间。
+    if num_page_splits is None or num_page_splits <= 0:
+        num_page_splits = 1
+
+    # GQA: map Q heads to KV heads via kv_group_num
+    num_kv_heads = k_metadata.shape[1]
+    assert num_q_heads % num_kv_heads == 0, "Invalid GQA config: Hq must be multiple of Hkv"
+    kv_group_num = num_q_heads // num_kv_heads
+    nvtx.range_push("quest_estimate_kernel_splits")
+
+    if not grouped or kv_group_num == 1:
+        # 弱 GQA / MHA：直接按 Q head 维度并行，每个 head 独立估计 page scores。
+        grid = (batch_size, num_q_heads, num_page_splits)
+        quest_estimate_split_kernel[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            req_pool_indices,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            req_pool_indices.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_SPLITS=num_page_splits,
+            kv_group_num=kv_group_num,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        # 强 GQA：estimated_scores 视为 [B, Hkv, max_pages]，按 KV head 维度并行，在
+        # kernel 内对组内所有 Q heads 做 score 的 group-reduction，并将 group score
+        # 存入对应的 KV 组槽位（不再扩展到 Q heads）。
+        grid = (batch_size, num_kv_heads, num_page_splits)
+        quest_estimate_split_kernel_grouped[grid](
+            q,
+            k_metadata,
+            seq_lens,
+            estimated_scores,
+            req_to_token,
+            req_pool_indices,
+            page_size,
+            head_dim,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_metadata.stride(0),
+            k_metadata.stride(1),
+            k_metadata.stride(2),
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            req_to_token.stride(0),
+            req_pool_indices.stride(0),
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_SPLITS=num_page_splits,
+            kv_group_num=kv_group_num,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    nvtx.range_pop()
+
+
+def quest_estimate_scores_torch(
     q: torch.Tensor,                    # [B, Hq, D]
     k_metadata: torch.Tensor,           # [num_pages, Hkv, D, 2]
     seq_lens: torch.Tensor,             # [B]
