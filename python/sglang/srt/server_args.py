@@ -187,6 +187,7 @@ class ServerArgs:
     # When False (default), strong GQA groups Q heads that share a KV head and lets
     # each group jointly select pages/tokens.
     quest_use_weak_gqa: bool = False
+    quest_estimate_kernel: Literal["triton", "torch"] = "triton"
 
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
@@ -1360,6 +1361,12 @@ class ServerArgs:
                 "By default (flag off), Quest groups Q heads that share a KV head "
                 "and lets each group jointly select pages/tokens (strong GQA)."
             ),
+        )
+        parser.add_argument(
+            "--quest-estimate-kernel",
+            type=str,
+            default=ServerArgs.quest_estimate_kernel,
+            help="The kernel to use for estimating scores in Quest. Default: triton",
         )
 
         # StreamingLLM (Attention Sinks)

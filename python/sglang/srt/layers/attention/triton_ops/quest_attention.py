@@ -1036,8 +1036,6 @@ def quest_estimate_scores_triton(
     req_pool_indices: torch.Tensor,     # [B]
     num_page_splits: int,
     grouped: bool = False,              # 是否在 KV 组上做 score 的 group-reduction
-    debug: bool = False,                # CPU 验证
-    max_pages_to_process: int | None = None,
 ):
     """
     Python 封装：估算 page-level 注意力得分
