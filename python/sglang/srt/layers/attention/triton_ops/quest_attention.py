@@ -989,13 +989,15 @@ def _quest_estimate_torch_impl(
     q_b = q_reshaped.unsqueeze(1)
     k_min = k_data[..., 0].unsqueeze(3)
     k_max = k_data[..., 1].unsqueeze(3)
-
-    # Optimization: select min/max based on sign of q
-    # If q > 0, we want k_max. If q < 0, we want k_min.
-    k_target = torch.where(q_b > 0, k_max, k_min)
+    
+    # Compute max(q * k_min, q * k_max) for each dimension
+    # This is the correct formula from the original Triton kernel
+    qk_min = q_b * k_min
+    qk_max = q_b * k_max
+    score_per_dim = torch.maximum(qk_min, qk_max)
 
     # [B, P, Hkv, G, D] -> sum over D -> [B, P, Hkv, G]
-    scores_g = torch.sum(q_b * k_target, dim=-1)
+    scores_g = torch.sum(score_per_dim, dim=-1)
 
     # 4. Handle grouping
     if grouped:
