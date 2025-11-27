@@ -469,6 +469,8 @@ class ServerArgs:
     # When False (default), strong GQA groups Q heads that share a KV head and lets
     # each group jointly select pages/tokens.
     quest_use_weak_gqa: bool = False
+    quest_estimate_kernel: Literal["triton", "torch"] = "triton"
+    quest_topk_kernel: Literal["max", "sort"] = "max"
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -3292,6 +3294,18 @@ class ServerArgs:
                 "By default (flag off), Quest groups Q heads that share a KV head "
                 "and lets each group jointly select pages/tokens (strong GQA)."
             ),
+        )
+        parser.add_argument(
+            "--quest-estimate-kernel",
+            type=str,
+            default=ServerArgs.quest_estimate_kernel,
+            help="The kernel to use for estimating scores in Quest. Default: triton",
+        )
+        parser.add_argument(
+            "--quest-topk-kernel",
+            type=str,
+            default=ServerArgs.quest_topk_kernel,
+            help="The kernel to use for selecting topk pages in Quest. Default: max",
         )
         # Offloading
         parser.add_argument(

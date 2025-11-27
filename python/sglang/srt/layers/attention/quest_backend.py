@@ -51,22 +51,20 @@ class QuestAttnBackend(AttentionBackend):
         
         # 延迟导入避免 CUDA context 初始化
         from sglang.srt.layers.attention.triton_ops.quest_attention import (
-            quest_estimate_scores,
+            quest_estimate_scores_triton,
+            quest_estimate_scores_torch,
             quest_select_topk_pages,
-            quest_select_topk_pages_grouped,
             quest_select_topk_pages_into,
-            quest_select_topk_pages_into_grouped,
             quest_update_kv_and_metadata,
             quest_compute_extend_metadata,
             quest_decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
         
-        self.quest_estimate_scores = quest_estimate_scores
+        self.quest_estimate_scores_triton = quest_estimate_scores_triton
+        self.quest_estimate_scores_torch = quest_estimate_scores_torch
         self.quest_select_topk_pages = quest_select_topk_pages
-        self.quest_select_topk_pages_grouped = quest_select_topk_pages_grouped
         self.quest_select_topk_pages_into = quest_select_topk_pages_into
-        self.quest_select_topk_pages_into_grouped = quest_select_topk_pages_into_grouped
         self.quest_update_kv_and_metadata = quest_update_kv_and_metadata
         self.quest_compute_extend_metadata = quest_compute_extend_metadata
         self.quest_decode_attention_fwd = quest_decode_attention_fwd
@@ -85,6 +83,8 @@ class QuestAttnBackend(AttentionBackend):
         # Quest GQA mode: when True, keep per-Q-head selection (weak GQA).
         # When False, group Q heads that share a KV head for estimate/select (strong GQA).
         self.use_weak_gqa = getattr(model_runner.server_args, "quest_use_weak_gqa", False)
+        self.quest_estimate_kernel = getattr(model_runner.server_args, "quest_estimate_kernel", "triton")
+        self.quest_topk_kernel = getattr(model_runner.server_args, "quest_topk_kernel", "max")
         
         # Extend 阶段 delegation：创建 TritonAttnBackend 实例
         # 用于处理非 Quest 的 extend 路径
@@ -280,18 +280,31 @@ class QuestAttnBackend(AttentionBackend):
                 est_buf = self.estimated_scores[:, : self.num_kv_head, :]
                 grouped_flag = True
 
-            self.quest_estimate_scores(
-                q=q_3d,
-                k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
-                seq_lens=forward_batch.seq_lens,
-                estimated_scores=est_buf,
-                page_size=self.page_size,
-                req_to_token=req_to_token_pool,
-                req_pool_indices=req_pool_indices,
-                num_page_splits=self.estimate_splits,
-                grouped=grouped_flag,
-                max_pages_to_process=self.forward_metadata["max_pages"],
-            )
+            if self.quest_estimate_kernel == "triton":
+                self.quest_estimate_scores_triton(
+                    q=q_3d,
+                    k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
+                    seq_lens=forward_batch.seq_lens,
+                    estimated_scores=est_buf,
+                    page_size=self.page_size,
+                    req_to_token=req_to_token_pool,
+                    req_pool_indices=req_pool_indices,
+                    num_page_splits=self.estimate_splits,
+                    grouped=grouped_flag,
+                )
+            else:
+                self.quest_estimate_scores_torch(
+                    q=q_3d,
+                    k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
+                    seq_lens=forward_batch.seq_lens,
+                    estimated_scores=est_buf,
+                    page_size=self.page_size,
+                    req_to_token=req_to_token_pool,
+                    req_pool_indices=req_pool_indices,
+                    num_page_splits=self.estimate_splits,
+                    grouped=grouped_flag,
+                    max_pages_to_process=self.forward_metadata["max_pages"],
+                )
             nvtx.range_pop()
 
             # Step 3: TopK Selection - 选择重要 pages
@@ -305,16 +318,18 @@ class QuestAttnBackend(AttentionBackend):
                     ],
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
+                    kernel_type=self.quest_topk_kernel,
                 )
             else:
                 # Strong GQA: TopK per KV head using grouped wrapper
-                kv_indptr, kv_indices = self.quest_select_topk_pages_grouped(
+                kv_indptr, kv_indices = self.quest_select_topk_pages(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
                     req_to_token=req_to_token_pool,
                     req_pool_indices=req_pool_indices,
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
+                    kernel_type=self.quest_topk_kernel,
                 )
             nvtx.range_pop()
             attn_logits = self.attn_logits
@@ -351,6 +366,8 @@ class QuestAttnBackend(AttentionBackend):
             #   buffer to avoid out-of-bounds writes when valid_pages > capture-time pages_cap.
             # - If using page-parallel kernel, keep the pages_cap view to reduce empty CTAs.
             pages_cap = getattr(self, "_cg_estimate_pages", None)
+            use_triton_estimate = self.quest_estimate_kernel == "triton"
+            
             if self.estimate_splits is not None and self.estimate_splits > 0:
                 # For split-kernel we must pass the full buffer in page dim.
                 if use_weak:
@@ -371,18 +388,31 @@ class QuestAttnBackend(AttentionBackend):
                         : forward_batch.batch_size, : self.num_kv_head, : pages_cap
                     ]
 
-            self.quest_estimate_scores(
-                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
-                seq_lens=forward_batch.seq_lens,
-                estimated_scores=est_buf,
-                page_size=self.page_size,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                num_page_splits=self.estimate_splits,
-                grouped=not use_weak,
-                max_pages_to_process=pages_cap,
-            )
+            if use_triton_estimate:
+                self.quest_estimate_scores_triton(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
+                    seq_lens=forward_batch.seq_lens,
+                    estimated_scores=est_buf,
+                    page_size=self.page_size,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    num_page_splits=self.estimate_splits,
+                    grouped=not use_weak,
+                )
+            else:
+                self.quest_estimate_scores_torch(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
+                    seq_lens=forward_batch.seq_lens,
+                    estimated_scores=est_buf,
+                    page_size=self.page_size,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    num_page_splits=self.estimate_splits,
+                    grouped=not use_weak,
+                    max_pages_to_process=pages_cap,
+                )
             nvtx.range_pop()
 
             # 3) Select+Expand+Pack into graph kv buffers (no allocations)
@@ -405,10 +435,11 @@ class QuestAttnBackend(AttentionBackend):
                     kv_indptr=kv_indptr[: bs_now + 1],
                     kv_indices=kv_indices,
                     num_heads=self.num_head,
+                    kernel_type=self.quest_topk_kernel,
                 )
             else:
                 # Strong GQA: per-KV-head select/expand/pack，使用 grouped wrapper。
-                self.quest_select_topk_pages_into_grouped(
+                self.quest_select_topk_pages_into(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
                     req_to_token=forward_batch.req_to_token_pool.req_to_token,
@@ -416,16 +447,13 @@ class QuestAttnBackend(AttentionBackend):
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
                     selected_pages=self.cuda_graph_selected_pages[:bs_now, : self.num_kv_head],
-                    kv_indices_buf=self.cuda_graph_kv_indices_buf[
-                        : bs_now * self.num_kv_head
-                    ],
-                    tokens_per_head=self.cuda_graph_tokens_per_head[
-                        : bs_now * self.num_kv_head
-                    ],
+                    kv_indices_buf=self.cuda_graph_kv_indices_buf[: bs_now * self.num_kv_head],
+                    tokens_per_head=self.cuda_graph_tokens_per_head[: bs_now * self.num_kv_head],
                     tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
                     kv_indptr=kv_indptr[: bs_now + 1],
                     kv_indices=kv_indices,
-                    num_kv_heads=self.num_kv_head,
+                    num_heads=self.num_kv_head,
+                    kernel_type=self.quest_topk_kernel,
                 )
             if num_kv_splits is not None:
                 num_kv_splits[:bs_now].fill_(self.max_kv_splits)
@@ -528,13 +556,10 @@ class QuestAttnBackend(AttentionBackend):
             "num_kv_splits": self.cuda_graph_num_kv_splits[:bs],
         }
         # Precompute a tighter pages cap for estimate to reduce overlaunch in graph
-        try:
-            max_pages_cap = (int(seq_lens[:bs].max().item()) + self.page_size - 1) // self.page_size
-            global_cap = (self.max_context_len + self.page_size - 1) // self.page_size
-            self._cg_estimate_pages = min(max_pages_cap, global_cap)
-        except Exception:
-            # Fallback to global cap
-            self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        # NOTE: In capture mode, seq_lens might be dummy (e.g. 1), so we cannot rely on it
+        # to determine the max_pages_cap for the graph. We must use the global context len
+        # to ensure the graph can handle any sequence length during replay.
+        self._cg_estimate_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self._graph_meta_ready = False
 
     def init_forward_metadata_replay_cuda_graph(
@@ -563,7 +588,7 @@ class QuestAttnBackend(AttentionBackend):
         self._graph_meta_ready = False
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+        return 4096
 
     # ---------------- Internal: Page alignment checker ----------------
 
