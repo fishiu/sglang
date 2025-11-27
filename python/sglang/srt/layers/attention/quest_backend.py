@@ -54,9 +54,7 @@ class QuestAttnBackend(AttentionBackend):
             quest_estimate_scores_triton,
             quest_estimate_scores_torch,
             quest_select_topk_pages,
-            quest_select_topk_pages_grouped,
             quest_select_topk_pages_into,
-            quest_select_topk_pages_into_grouped,
             quest_update_kv_and_metadata,
             quest_compute_extend_metadata,
             quest_decode_attention_fwd,
@@ -66,9 +64,7 @@ class QuestAttnBackend(AttentionBackend):
         self.quest_estimate_scores_triton = quest_estimate_scores_triton
         self.quest_estimate_scores_torch = quest_estimate_scores_torch
         self.quest_select_topk_pages = quest_select_topk_pages
-        self.quest_select_topk_pages_grouped = quest_select_topk_pages_grouped
         self.quest_select_topk_pages_into = quest_select_topk_pages_into
-        self.quest_select_topk_pages_into_grouped = quest_select_topk_pages_into_grouped
         self.quest_update_kv_and_metadata = quest_update_kv_and_metadata
         self.quest_compute_extend_metadata = quest_compute_extend_metadata
         self.quest_decode_attention_fwd = quest_decode_attention_fwd
@@ -88,6 +84,7 @@ class QuestAttnBackend(AttentionBackend):
         # When False, group Q heads that share a KV head for estimate/select (strong GQA).
         self.use_weak_gqa = getattr(model_runner.server_args, "quest_use_weak_gqa", False)
         self.quest_estimate_kernel = getattr(model_runner.server_args, "quest_estimate_kernel", "triton")
+        self.quest_topk_kernel = getattr(model_runner.server_args, "quest_topk_kernel", "max")
         
         # Extend 阶段 delegation：创建 TritonAttnBackend 实例
         # 用于处理非 Quest 的 extend 路径
@@ -321,16 +318,18 @@ class QuestAttnBackend(AttentionBackend):
                     ],
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
+                    kernel_type=self.quest_topk_kernel,
                 )
             else:
                 # Strong GQA: TopK per KV head using grouped wrapper
-                kv_indptr, kv_indices = self.quest_select_topk_pages_grouped(
+                kv_indptr, kv_indices = self.quest_select_topk_pages(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
                     req_to_token=req_to_token_pool,
                     req_pool_indices=req_pool_indices,
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
+                    kernel_type=self.quest_topk_kernel,
                 )
             nvtx.range_pop()
             attn_logits = self.attn_logits
@@ -436,10 +435,11 @@ class QuestAttnBackend(AttentionBackend):
                     kv_indptr=kv_indptr[: bs_now + 1],
                     kv_indices=kv_indices,
                     num_heads=self.num_head,
+                    kernel_type=self.quest_topk_kernel,
                 )
             else:
                 # Strong GQA: per-KV-head select/expand/pack，使用 grouped wrapper。
-                self.quest_select_topk_pages_into_grouped(
+                self.quest_select_topk_pages_into(
                     estimated_scores=est_buf,
                     seq_lens=forward_batch.seq_lens,
                     req_to_token=forward_batch.req_to_token_pool.req_to_token,
@@ -447,16 +447,13 @@ class QuestAttnBackend(AttentionBackend):
                     quest_topk=self.quest_topk,
                     page_size=self.page_size,
                     selected_pages=self.cuda_graph_selected_pages[:bs_now, : self.num_kv_head],
-                    kv_indices_buf=self.cuda_graph_kv_indices_buf[
-                        : bs_now * self.num_kv_head
-                    ],
-                    tokens_per_head=self.cuda_graph_tokens_per_head[
-                        : bs_now * self.num_kv_head
-                    ],
+                    kv_indices_buf=self.cuda_graph_kv_indices_buf[: bs_now * self.num_kv_head],
+                    tokens_per_head=self.cuda_graph_tokens_per_head[: bs_now * self.num_kv_head],
                     tokens_per_batch=self.cuda_graph_tokens_per_batch[:bs_now],
                     kv_indptr=kv_indptr[: bs_now + 1],
                     kv_indices=kv_indices,
-                    num_kv_heads=self.num_kv_head,
+                    num_heads=self.num_kv_head,
+                    kernel_type=self.quest_topk_kernel,
                 )
             if num_kv_splits is not None:
                 num_kv_splits[:bs_now].fill_(self.max_kv_splits)

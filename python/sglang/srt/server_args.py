@@ -188,6 +188,7 @@ class ServerArgs:
     # each group jointly select pages/tokens.
     quest_use_weak_gqa: bool = False
     quest_estimate_kernel: Literal["triton", "torch"] = "triton"
+    quest_topk_kernel: Literal["max", "sort"] = "max"
 
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
@@ -1367,6 +1368,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quest_estimate_kernel,
             help="The kernel to use for estimating scores in Quest. Default: triton",
+        )
+        parser.add_argument(
+            "--quest-topk-kernel",
+            type=str,
+            default=ServerArgs.quest_topk_kernel,
+            help="The kernel to use for selecting topk pages in Quest. Default: max",
         )
 
         # StreamingLLM (Attention Sinks)

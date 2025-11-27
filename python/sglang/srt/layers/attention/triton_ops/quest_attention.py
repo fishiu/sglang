@@ -1186,7 +1186,7 @@ def quest_estimate_scores_torch(
 
 
 @triton.jit
-def quest_select_topk_kernel(
+def quest_select_topk_kernel_max(
     estimated_scores_ptr,
     seq_lens_ptr,
     selected_pages_ptr,
@@ -1233,6 +1233,97 @@ def quest_select_topk_kernel(
             scores = tl.where(offs == max_idx, -float("inf"), scores)
 
     # append last page to the last slot
+    last_page = tl.where(num_pages > 0, num_pages - 1, 0)
+    tl.store(selected_base + (quest_topk - 1), last_page.to(tl.int32))
+
+
+@triton.jit
+def quest_select_topk_kernel_sort(
+    estimated_scores_ptr,
+    seq_lens_ptr,
+    selected_pages_ptr,
+    stride_sb,
+    stride_sh,
+    stride_sel_b,
+    stride_sel_h,
+    page_size: tl.constexpr,
+    quest_topk: tl.constexpr,       # total selected pages including last page
+    max_pages: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,      # next power-of-2 of max_pages
+    BLOCK_SLOTS: tl.constexpr,      # next power-of-2 of quest_topk
+    num_heads: tl.constexpr,
+    K_P2: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    batch_idx = program_id // num_heads
+    head_idx = program_id % num_heads
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    num_pages = (seq_len + page_size - 1) // page_size
+    valid_pages = tl.maximum(num_pages - 1, 0)
+
+    scores_base = estimated_scores_ptr + batch_idx * stride_sb + head_idx * stride_sh
+    offs = tl.arange(0, BLOCK_PAGES)
+    # Load scores, mask invalid/padding with -inf
+    scores = tl.load(scores_base + offs, mask=offs < max_pages, other=-float("inf"))
+    scores = tl.where(offs < valid_pages, scores, -float("inf"))
+
+    selected_base = selected_pages_ptr + batch_idx * stride_sel_b + head_idx * stride_sel_h
+    idx_slots = tl.arange(0, BLOCK_SLOTS)
+    # initialize to -1
+    tl.store(
+        selected_base + idx_slots, tl.full([BLOCK_SLOTS], -1, dtype=tl.int32), mask=idx_slots < quest_topk
+    )
+
+    K_SELECT: tl.constexpr = quest_topk - 1
+
+    # Case 1: Not enough valid pages to fill K-1 slots
+    # We just select all valid pages (0 to valid_pages-1)
+    if valid_pages <= K_SELECT:
+        rng = tl.arange(0, BLOCK_SLOTS)
+        sequential = tl.where(rng < valid_pages, rng, -1)
+        # store only up to K_SELECT slots (though valid_pages is smaller, mask handles it)
+        tl.store(selected_base + rng, sequential, mask=rng < K_SELECT)
+    else:
+        # Case 2: Use tl.topk to select top K-1 pages
+        if K_SELECT > 0:
+             # --- Packing Logic ---
+             # Float32 -> Int32 bitcast
+             i_scores = scores.to(tl.int32, bitcast=True)
+             
+             # Map to Monotonic Int32 (Descending Sort friendly)
+             # If x < 0: mask = 0x7FFFFFFF. key = x ^ mask. (-inf->MinInt, -0->-1)
+             # If x >= 0: mask = 0. key = x. (+0->0, +inf->MaxInt)
+             # Total order: -inf < -0 < +0 < +inf.
+             mask = tl.where(i_scores < 0, 0x7FFFFFFF, 0).to(tl.int32)
+             mapped_scores = i_scores ^ mask
+             
+             # Pack into Int64: [Score(32) | Index(32)]
+             # Ensure bitwise operations use 64-bit container
+             # mapped_scores is int32. 
+             # We need to cast to int64. 
+             # Note: mapped_scores is SIGNED int32. 
+             # -inf maps to 0x80000000 (-2^31).
+             # Casting to int64 preserves value (sign extension).
+             # -2^31 -> -2^31 in int64 (FFFF...8000...).
+             # Shift << 32 -> FFFF..8000..0000..
+             # This preserves order for Signed Int64 comparison.
+             packed = (mapped_scores.to(tl.int64) << 32) | offs.to(tl.int64)
+             
+             # tl.topk
+             # Ensure K for topk is power of 2 to match register shape requirements
+             # (Triton primitives often return power-of-2 sized tensors)
+             # We ask for slightly more if K_SELECT is not power of 2, then mask store.
+             topk_packed = tl.topk(packed, K_P2)
+             
+             # Unpack indices (Low 32 bits)
+             topk_indices = topk_packed.to(tl.int32)
+             
+             # Store
+             offs_store = tl.arange(0, K_P2)
+             tl.store(selected_base + offs_store, topk_indices, mask=offs_store < K_SELECT)
+             
+    # append last page to the last slot (index quest_topk - 1)
     last_page = tl.where(num_pages > 0, num_pages - 1, 0)
     tl.store(selected_base + (quest_topk - 1), last_page.to(tl.int32))
 
@@ -1355,6 +1446,7 @@ def quest_select_topk_pages(
     req_pool_indices: torch.Tensor,     # [batch]
     quest_topk: int,
     page_size: int,
+    kernel_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """选择 topk-1 个非末页并追加 last page，共 quest_topk 个页；展开为 CSR 索引。"""
     batch_size, num_heads, max_pages = estimated_scores.shape
@@ -1372,21 +1464,39 @@ def quest_select_topk_pages(
     BLOCK_SLOTS = triton.next_power_of_2(quest_topk)
 
     grid = (batch_size * num_heads,)
-    quest_select_topk_kernel[grid](
-        estimated_scores,
-        seq_lens,
-        selected_pages,
-        estimated_scores.stride(0),
-        estimated_scores.stride(1),
-        selected_pages.stride(0),
-        selected_pages.stride(1),
-        page_size=page_size,
-        quest_topk=quest_topk,
-        max_pages=max_pages,
-        BLOCK_PAGES=BLOCK_PAGES,
-        BLOCK_SLOTS=BLOCK_SLOTS,
-        num_heads=num_heads,
-    )
+    if kernel_type == "max":
+        quest_select_topk_kernel_max[grid](
+            estimated_scores,
+            seq_lens,
+            selected_pages,
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            selected_pages.stride(0),
+            selected_pages.stride(1),
+            page_size=page_size,
+            quest_topk=quest_topk,
+            max_pages=max_pages,
+            BLOCK_PAGES=BLOCK_PAGES,
+            BLOCK_SLOTS=BLOCK_SLOTS,
+            num_heads=num_heads,
+        )
+    elif kernel_type == "sort":
+        quest_select_topk_kernel_sort[grid](
+            estimated_scores,
+            seq_lens,
+            selected_pages,
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            selected_pages.stride(0),
+            selected_pages.stride(1),
+            page_size=page_size,
+            quest_topk=quest_topk,
+            max_pages=max_pages,
+            BLOCK_PAGES=BLOCK_PAGES,
+            BLOCK_SLOTS=BLOCK_SLOTS,
+            num_heads=num_heads,
+            K_P2=triton.next_power_of_2(max(1, quest_topk - 1)),
+        )
 
     tokens_cap = quest_topk * page_size
     BLOCK_TOKENS = triton.next_power_of_2(tokens_cap)
@@ -1465,28 +1575,6 @@ def quest_select_topk_pages(
     # no debug printing
 
     return kv_indptr, kv_indices
-
-
-def quest_select_topk_pages_grouped(
-    estimated_scores: torch.Tensor,     # [batch, num_kv_heads, max_pages]
-    seq_lens: torch.Tensor,             # [batch]
-    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
-    req_pool_indices: torch.Tensor,     # [batch]
-    quest_topk: int,
-    page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Grouped-topk 版本：按 KV 头选择 page，并共享给同组 Q 头。
-
-    只是将 num_heads 换成 num_kv_heads，内部直接复用 quest_select_topk_pages。
-    """
-    return quest_select_topk_pages(
-        estimated_scores=estimated_scores,
-        seq_lens=seq_lens,
-        req_to_token=req_to_token,
-        req_pool_indices=req_pool_indices,
-        quest_topk=quest_topk,
-        page_size=page_size,
-    )
 
 
 @triton.jit
@@ -1590,6 +1678,7 @@ def quest_select_topk_pages_into(
     kv_indptr: torch.Tensor,            # prealloc [bs+1]
     kv_indices: torch.Tensor,           # prealloc big 1D buffer
     num_heads: int,
+    kernel_type: str,
 ):
     device = estimated_scores.device
     bs = estimated_scores.shape[0]
@@ -1600,21 +1689,39 @@ def quest_select_topk_pages_into(
     BLOCK_PAGES = triton.next_power_of_2(max_pages)
     BLOCK_SLOTS = triton.next_power_of_2(quest_topk)
     grid_sel = (bs * num_heads,)
-    quest_select_topk_kernel[grid_sel](
-        estimated_scores,
-        seq_lens,
-        selected_pages,
-        estimated_scores.stride(0),
-        estimated_scores.stride(1),
-        selected_pages.stride(0),
-        selected_pages.stride(1),
-        page_size=page_size,
-        quest_topk=quest_topk,
-        max_pages=max_pages,
-        BLOCK_PAGES=BLOCK_PAGES,
-        BLOCK_SLOTS=BLOCK_SLOTS,
-        num_heads=num_heads,
-    )
+    if kernel_type == "max":
+        quest_select_topk_kernel_max[grid_sel](
+            estimated_scores,
+            seq_lens,
+            selected_pages,
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            selected_pages.stride(0),
+            selected_pages.stride(1),
+            page_size=page_size,
+            quest_topk=quest_topk,
+            max_pages=max_pages,
+            BLOCK_PAGES=BLOCK_PAGES,
+            BLOCK_SLOTS=BLOCK_SLOTS,
+            num_heads=num_heads,
+        )
+    elif kernel_type == "sort":
+        quest_select_topk_kernel_sort[grid_sel](
+            estimated_scores,
+            seq_lens,
+            selected_pages,
+            estimated_scores.stride(0),
+            estimated_scores.stride(1),
+            selected_pages.stride(0),
+            selected_pages.stride(1),
+            page_size=page_size,
+            quest_topk=quest_topk,
+            max_pages=max_pages,
+            BLOCK_PAGES=BLOCK_PAGES,
+            BLOCK_SLOTS=BLOCK_SLOTS,
+            num_heads=num_heads,
+            K_P2=triton.next_power_of_2(max(1, quest_topk - 1)),
+        )
 
     # 2) expand pages to tokens (per head) + count tokens per head
     BLOCK_TOKENS = triton.next_power_of_2(tokens_cap)
@@ -1672,42 +1779,6 @@ def quest_select_topk_pages_into(
         ITERS,
     )
 
-
-def quest_select_topk_pages_into_grouped(
-    estimated_scores: torch.Tensor,     # [bs, num_kv_heads, max_pages_cap]
-    seq_lens: torch.Tensor,             # [bs]
-    req_to_token: torch.Tensor,         # [max_pool, max_context_len]
-    req_pool_indices: torch.Tensor,     # [bs]
-    quest_topk: int,
-    page_size: int,
-    selected_pages: torch.Tensor,       # prealloc [bs, num_kv_heads, quest_topk]
-    kv_indices_buf: torch.Tensor,       # prealloc [(bs*num_kv_heads), tokens_cap]
-    tokens_per_head: torch.Tensor,      # prealloc [(bs*num_kv_heads)]
-    tokens_per_batch: torch.Tensor,     # prealloc [bs]
-    kv_indptr: torch.Tensor,            # prealloc [bs+1]
-    kv_indices: torch.Tensor,           # prealloc big 1D buffer
-    num_kv_heads: int,
-):
-    """Grouped variant of quest_select_topk_pages_into using KV heads.
-
-    This thin wrapper forwards to the per-head implementation with num_heads
-    set to num_kv_heads, so the underlying Triton kernels are fully reused.
-    """
-    quest_select_topk_pages_into(
-        estimated_scores=estimated_scores,
-        seq_lens=seq_lens,
-        req_to_token=req_to_token,
-        req_pool_indices=req_pool_indices,
-        quest_topk=quest_topk,
-        page_size=page_size,
-        selected_pages=selected_pages,
-        kv_indices_buf=kv_indices_buf,
-        tokens_per_head=tokens_per_head,
-        tokens_per_batch=tokens_per_batch,
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        num_heads=num_kv_heads,
-    )
 
 def quest_update_kv_and_metadata(
     k_new: torch.Tensor,                # [batch, num_heads, head_dim]
