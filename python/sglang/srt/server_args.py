@@ -190,6 +190,13 @@ class ServerArgs:
     quest_estimate_kernel: Literal["triton", "torch"] = "triton"
     quest_topk_kernel: Literal["max", "sort"] = "max"
 
+    # SnapKV
+    enable_snapkv: bool = False
+    snapkv_window_size: int = 64
+    snapkv_max_capacity: int = 2048
+    snapkv_kernel_size: int = 5
+    snapkv_pooling: str = "avgpool"
+
     # StreamingLLM (Attention Sinks)
     enable_streaming_llm: bool = False
     streaming_llm_window_length: int = 512
@@ -1374,6 +1381,38 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quest_topk_kernel,
             help="The kernel to use for selecting topk pages in Quest. Default: max",
+        )
+
+        # SnapKV
+        parser.add_argument(
+            "--enable-snapkv",
+            action="store_true",
+            help="Enable SnapKV for efficient long-context inference.",
+        )
+        parser.add_argument(
+            "--snapkv-window-size",
+            type=int,
+            default=ServerArgs.snapkv_window_size,
+            help="SnapKV observation window size.",
+        )
+        parser.add_argument(
+            "--snapkv-max-capacity",
+            type=int,
+            default=ServerArgs.snapkv_max_capacity,
+            help="SnapKV maximum KV cache capacity per sequence.",
+        )
+        parser.add_argument(
+            "--snapkv-kernel-size",
+            type=int,
+            default=ServerArgs.snapkv_kernel_size,
+            help="SnapKV pooling kernel size.",
+        )
+        parser.add_argument(
+            "--snapkv-pooling",
+            type=str,
+            default=ServerArgs.snapkv_pooling,
+            choices=["avgpool", "maxpool"],
+            help="SnapKV pooling method.",
         )
 
         # StreamingLLM (Attention Sinks)

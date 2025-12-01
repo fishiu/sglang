@@ -1219,6 +1219,10 @@ class ModelRunner:
                 )
 
                 return QuestAttnBackend(self)
+            elif self.server_args.enable_snapkv:
+                from sglang.srt.layers.attention.snapkv_backend import SnapKVBackend
+
+                return SnapKVBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
