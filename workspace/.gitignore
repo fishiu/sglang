@@ -1,0 +1,13 @@
+# workspace/.gitignore
+
+*
+!/.gitignore
+
+!/docs/
+!/docs/**
+
+!/exp/
+/exp/*
+!/exp/harness/
+/exp/harness/*
+!/exp/harness/generator.py
