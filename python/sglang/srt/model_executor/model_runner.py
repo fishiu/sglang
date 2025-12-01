@@ -29,6 +29,9 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+normal_repr = torch.Tensor.__repr__
+torch.Tensor.__repr__ = lambda self: f"{tuple(self.shape)} {normal_repr(self)}"
+
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,

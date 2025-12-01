@@ -588,7 +588,7 @@ class QuestAttnBackend(AttentionBackend):
         self._graph_meta_ready = False
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 4096
+        return 1
 
     # ---------------- Internal: Page alignment checker ----------------
 
