@@ -11,3 +11,4 @@
 !/exp/harness/
 /exp/harness/*
 !/exp/harness/generator.py
+!/exp/harness/analysis.ipynb
