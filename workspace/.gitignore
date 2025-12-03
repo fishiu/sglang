@@ -12,3 +12,4 @@
 /exp/harness/*
 !/exp/harness/generator.py
 !/exp/harness/analysis.ipynb
+!/exp/harness/log_parser.py
