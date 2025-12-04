@@ -52,10 +52,11 @@ def main():
     parser.add_argument('--limit', default='1', help='limit options (float list)')
     parser.add_argument('--bsz', default='auto', help='batch_size options (auto or int list)')
     parser.add_argument('--ctx', default='none', help='context_length options (none or int list)')
-    parser.add_argument('--tasks', default='mmlu', help='Comma separated list of tasks (mmlu, longbench, ruler)')
+    parser.add_argument('--tasks', default='mmlu', help='Comma separated list of tasks (mmlu, longbench, ruler, aime)')
     parser.add_argument('--run', default='1', help='Run IDs (int list or range start:end:step). e.g. 1,2 or 1:3:1')
     parser.add_argument('--output', default='run_eval.sh', help='Output shell script file path')
     parser.add_argument('--array', type=int, default=10, help='Maximum number of parallel jobs for SLURM array')
+    parser.add_argument('--log_level', default='info', help='log_level options (comma separated string)')
     parser.add_argument('--name', required=True, help='Directory name for storing logs (e.g., 20251128/ruler)')
 
     args = parser.parse_args()
@@ -114,6 +115,7 @@ def main():
     print(f"  BatchSizes: {bszs}")
     print(f"  ContextLengths: {ctxs}")
     print(f"  Tasks: {tasks}")
+    print(f"  LogLevel: {args.log_level}")
     print(f"  Runs: {runs}")
     print(f"  Max Parallel Jobs: {args.array}")
     print(f"  Log Directory: {args.name}")
@@ -160,23 +162,26 @@ def main():
             "dtype=auto",
             f"mem_fraction_static={c['frac']}",
             f"page_size={c['pg']}",
+            f"log_level={args.log_level}",
+            "enable_nan_detection=True",
+            "attention_backend=triton"
         ]
         
         if c['ctx'] != 'none':
             ma.append(f"context_length={c['ctx']}")
 
         if args.method == 'quest':
-            ma.append("enable_quest")
+            ma.append("enable_quest=True")
             ma.append(f"quest_topk={c['topk']}")
             ma.append(f"quest_estimate_kernel={c['est']}")
         elif args.method == 'stream':
-            ma.append("enable_streaming_llm")
+            ma.append("enable_streaming_llm=True")
             ma.append(f"streaming_llm_window_length={c['wind']}")
             ma.append(f"streaming_llm_num_sink_tokens={c['sink']}")
 
         # Handle graph (0 -> disable, 1 -> default/enable)
         if c['graph'] == 0:
-            ma.append("disable_cuda_graph")
+            ma.append("disable_cuda_graph=True")
         
         model_args_str = ",".join(ma)
 
@@ -231,7 +236,7 @@ def main():
             # f.write(f"#SBATCH --error={args.name}/job_%a.err\n")
             f.write(f"#SBATCH --error=/dev/null\n")
             f.write("#SBATCH --partition=normal\n")
-            f.write("#SBATCH --time=3:00:00\n")
+            f.write("#SBATCH --time=6:00:00\n")
             
             # Determine number of tasks
             num_experiments = len(experiments)
