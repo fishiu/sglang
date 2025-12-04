@@ -126,6 +126,23 @@ class RulerInfo(ExperimentInfo):
                     pass
         return None
 
+class AimeInfo(ExperimentInfo):
+    def extract_score(self):
+        # Look for |aime ...
+        # Example: |aime24|      0|none  |     0|exact_match|↑  |  0.4|±  | 0.091|
+        lines = self.read_last_lines(200)
+        for line in lines:
+            if "|aime" in line:
+                parts = [p.strip() for p in line.split('|')]
+                try:
+                    # Value is at index 7
+                    val_str = parts[7]
+                    self.score = float(val_str)
+                    return self.score
+                except (ValueError, IndexError):
+                    pass
+        return None
+
 def get_experiment_info(log_path):
     base_name = os.path.basename(log_path)
     if 'tasks_longbench' in base_name:
@@ -134,6 +151,8 @@ def get_experiment_info(log_path):
         return MMLUInfo(log_path)
     elif 'tasks_ruler' in base_name:
         return RulerInfo(log_path)
+    elif 'tasks_aime' in base_name:
+        return AimeInfo(log_path)
     else:
         return ExperimentInfo(log_path)
 
