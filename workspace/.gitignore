@@ -13,3 +13,7 @@
 !/exp/harness/generator.py
 !/exp/harness/analysis.ipynb
 !/exp/harness/log_parser.py
+
+!/double_sparsity/
+/double_sparsity/*
+!/double_sparsity/calib.py
