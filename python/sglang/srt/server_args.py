@@ -183,6 +183,9 @@ class ServerArgs:
     enable_quest: bool = False
     quest_topk: int = 16  # Maximum number of pages to keep (excluding last page)
     quest_estimate_splits: int = 8
+    # When True, use split estimate kernels (current default).
+    # When False, use the legacy page-parallel estimate kernel (MHA-only).
+    quest_estimate_split: bool = True
     # Quest GQA mode: when True, use the original per-Q-head selection ("weak" GQA).
     # When False (default), strong GQA groups Q heads that share a KV head and lets
     # each group jointly select pages/tokens.
@@ -1360,6 +1363,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.quest_estimate_splits,
             help="Triton grid size when computing estimate scores, split all pages. Default: 8",
+        )
+        parser.add_argument(
+            "--quest-estimate-split",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.quest_estimate_split,
+            help=(
+                "Whether to use the split Quest estimate kernels. "
+                "When disabled, use the legacy page-parallel estimate kernel (MHA-only). "
+                "Default: enabled."
+            ),
         )
         parser.add_argument(
             "--quest-use-weak-gqa",

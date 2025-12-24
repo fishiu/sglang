@@ -1053,73 +1053,106 @@ def quest_estimate_scores_triton(
     # Splits 配置：固定 NUM_SPLITS，kernel 内部循环 pages。
     # num_page_splits 是一个较小的常数（如 8/16/32），用于在 page 维做粗
     # 粒度切分，避免单个 program 处理过长的 page 区间。
-    if num_page_splits is None or num_page_splits <= 0:
-        num_page_splits = 1
+    use_split_kernel = num_page_splits is not None and num_page_splits > 0
 
     # GQA: map Q heads to KV heads via kv_group_num
     num_kv_heads = k_metadata.shape[1]
     assert num_q_heads % num_kv_heads == 0, "Invalid GQA config: Hq must be multiple of Hkv"
     kv_group_num = num_q_heads // num_kv_heads
-    nvtx.range_push("quest_estimate_kernel_splits")
+    nvtx.range_push("quest_estimate_kernel")
 
-    if not grouped or kv_group_num == 1:
-        # 弱 GQA / MHA：直接按 Q head 维度并行，每个 head 独立估计 page scores。
-        grid = (batch_size, num_q_heads, num_page_splits)
-        quest_estimate_split_kernel[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            req_pool_indices,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            req_pool_indices.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            NUM_SPLITS=num_page_splits,
-            kv_group_num=kv_group_num,
-            num_warps=4,
-            num_stages=2,
-        )
-    else:
-        # 强 GQA：estimated_scores 视为 [B, Hkv, max_pages]，按 KV head 维度并行，在
-        # kernel 内对组内所有 Q heads 做 score 的 group-reduction，并将 group score
-        # 存入对应的 KV 组槽位（不再扩展到 Q heads）。
-        grid = (batch_size, num_kv_heads, num_page_splits)
-        quest_estimate_split_kernel_grouped[grid](
-            q,
-            k_metadata,
-            seq_lens,
-            estimated_scores,
-            req_to_token,
-            req_pool_indices,
-            page_size,
-            head_dim,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_metadata.stride(0),
-            k_metadata.stride(1),
-            k_metadata.stride(2),
-            estimated_scores.stride(0),
-            estimated_scores.stride(1),
-            req_to_token.stride(0),
-            req_pool_indices.stride(0),
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            NUM_SPLITS=num_page_splits,
-            kv_group_num=kv_group_num,
-            num_warps=4,
-            num_stages=2,
-        )
+    if not use_split_kernel:
+        # Legacy (non-split) estimate kernel: grid is page-parallel.
+        # NOTE: This path is MHA-only (kv_group_num == 1, grouped == False).
+        # We keep the behavior permissive; callers are responsible for ensuring correctness.
+        if grouped or kv_group_num != 1:
+            # Fallback to split kernel to avoid signature/shape mismatches.
+            use_split_kernel = True
+        else:
+            # Legacy kernel expects req_to_token shaped as [B, max_context_len].
+            req_to_token_batch = req_to_token[req_pool_indices]
+            grid = (batch_size, num_q_heads, max_pages)
+            quest_estimate_kernel[grid](
+                q,
+                k_metadata,
+                seq_lens,
+                estimated_scores,
+                req_to_token_batch,
+                page_size,
+                head_dim,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_metadata.stride(0),
+                k_metadata.stride(1),
+                k_metadata.stride(2),
+                estimated_scores.stride(0),
+                estimated_scores.stride(1),
+                req_to_token_batch.stride(0),
+                BLOCK_DMODEL=BLOCK_DMODEL,
+                num_warps=4,
+                num_stages=2,
+            )
+
+    if use_split_kernel:
+        if not grouped or kv_group_num == 1:
+            # 弱 GQA / MHA：直接按 Q head 维度并行，每个 head 独立估计 page scores。
+            grid = (batch_size, num_q_heads, num_page_splits)
+            quest_estimate_split_kernel[grid](
+                q,
+                k_metadata,
+                seq_lens,
+                estimated_scores,
+                req_to_token,
+                req_pool_indices,
+                page_size,
+                head_dim,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_metadata.stride(0),
+                k_metadata.stride(1),
+                k_metadata.stride(2),
+                estimated_scores.stride(0),
+                estimated_scores.stride(1),
+                req_to_token.stride(0),
+                req_pool_indices.stride(0),
+                BLOCK_DMODEL=BLOCK_DMODEL,
+                NUM_SPLITS=num_page_splits,
+                kv_group_num=kv_group_num,
+                num_warps=4,
+                num_stages=2,
+            )
+        else:
+            # 强 GQA：estimated_scores 视为 [B, Hkv, max_pages]，按 KV head 维度并行，在
+            # kernel 内对组内所有 Q heads 做 score 的 group-reduction，并将 group score
+            # 存入对应的 KV 组槽位（不再扩展到 Q heads）。
+            grid = (batch_size, num_kv_heads, num_page_splits)
+            quest_estimate_split_kernel_grouped[grid](
+                q,
+                k_metadata,
+                seq_lens,
+                estimated_scores,
+                req_to_token,
+                req_pool_indices,
+                page_size,
+                head_dim,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_metadata.stride(0),
+                k_metadata.stride(1),
+                k_metadata.stride(2),
+                estimated_scores.stride(0),
+                estimated_scores.stride(1),
+                req_to_token.stride(0),
+                req_pool_indices.stride(0),
+                BLOCK_DMODEL=BLOCK_DMODEL,
+                NUM_SPLITS=num_page_splits,
+                kv_group_num=kv_group_num,
+                num_warps=4,
+                num_stages=2,
+            )
 
     nvtx.range_pop()
 

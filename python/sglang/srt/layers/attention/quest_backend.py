@@ -85,6 +85,7 @@ class QuestAttnBackend(AttentionBackend):
         self.use_weak_gqa = getattr(model_runner.server_args, "quest_use_weak_gqa", False)
         self.quest_estimate_kernel = getattr(model_runner.server_args, "quest_estimate_kernel", "triton")
         self.quest_topk_kernel = getattr(model_runner.server_args, "quest_topk_kernel", "max")
+        self.quest_estimate_split = getattr(model_runner.server_args, "quest_estimate_split", True)
         
         # Extend 阶段 delegation：创建 TritonAttnBackend 实例
         # 用于处理非 Quest 的 extend 路径
@@ -281,6 +282,7 @@ class QuestAttnBackend(AttentionBackend):
                 grouped_flag = True
 
             if self.quest_estimate_kernel == "triton":
+                estimate_splits = self.estimate_splits if self.quest_estimate_split else 0
                 self.quest_estimate_scores_triton(
                     q=q_3d,
                     k_metadata=forward_batch.token_to_kv_pool.get_metadata_buffer(layer.layer_id),
@@ -289,7 +291,7 @@ class QuestAttnBackend(AttentionBackend):
                     page_size=self.page_size,
                     req_to_token=req_to_token_pool,
                     req_pool_indices=req_pool_indices,
-                    num_page_splits=self.estimate_splits,
+                    num_page_splits=estimate_splits,
                     grouped=grouped_flag,
                 )
             else:
@@ -367,8 +369,9 @@ class QuestAttnBackend(AttentionBackend):
             # - If using page-parallel kernel, keep the pages_cap view to reduce empty CTAs.
             pages_cap = getattr(self, "_cg_estimate_pages", None)
             use_triton_estimate = self.quest_estimate_kernel == "triton"
+            estimate_splits = self.estimate_splits if self.quest_estimate_split else 0
             
-            if self.estimate_splits is not None and self.estimate_splits > 0:
+            if estimate_splits is not None and estimate_splits > 0:
                 # For split-kernel we must pass the full buffer in page dim.
                 if use_weak:
                     est_buf = self.cuda_graph_estimated_scores[: forward_batch.batch_size]
@@ -397,7 +400,7 @@ class QuestAttnBackend(AttentionBackend):
                     page_size=self.page_size,
                     req_to_token=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
-                    num_page_splits=self.estimate_splits,
+                    num_page_splits=estimate_splits,
                     grouped=not use_weak,
                 )
             else:
