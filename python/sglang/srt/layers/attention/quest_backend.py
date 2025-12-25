@@ -107,6 +107,9 @@ class QuestAttnBackend(AttentionBackend):
         # TODO(xiaoyuan): compute splits num dynamiclly
         self.estimate_splits: int = model_runner.server_args.quest_estimate_splits
 
+        # Debug: print estimate configuration once when QUEST_DEBUG_ESTIMATE=1.
+        self._quest_estimate_debug_printed: bool = False
+
         # CUDA Graph related buffers (lazily initialized)
         self.cuda_graph_attn_logits: Optional[torch.Tensor] = None
         self.cuda_graph_attn_lse: Optional[torch.Tensor] = None
@@ -251,6 +254,23 @@ class QuestAttnBackend(AttentionBackend):
             kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
         is_mha = kv_group_num == 1
         use_weak = self.use_weak_gqa or is_mha
+
+        # Optional one-time debug print (won't spam logs).
+        if (not self._quest_estimate_debug_printed) and os.environ.get(
+            "QUEST_DEBUG_ESTIMATE", "0"
+        ) == "1":
+            self._quest_estimate_debug_printed = True
+            # Keep this short: one line, core knobs only.
+            # Note: grouped estimate happens when (not use_weak) and kv_group_num > 1.
+            print(
+                "[Quest][estimate] "
+                f"bs={forward_batch.batch_size} "
+                f"Hq={layer.tp_q_head_num} Hkv={layer.tp_k_head_num} D={layer.qk_head_dim} "
+                f"kv_group_num={kv_group_num} use_weak={use_weak} "
+                f"grouped={not use_weak} "
+                f"split_enabled={self.quest_estimate_split} "
+                f"splits={self.estimate_splits}"
+            )
 
         if not use_graph_meta:
             # Step 1: 更新 KV cache 和元数据

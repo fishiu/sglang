@@ -886,11 +886,30 @@ def quest_estimate_split_kernel_grouped(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     mask_d = offs_d < head_dim
 
+    # Precompute group-wise Q statistics once per program to avoid reloading Q for every page.
+    # For each dimension d:
+    #   sum_g max(q_gd * kmin_d, q_gd * kmax_d)
+    # = kmax_d * sum_g max(q_gd, 0) + kmin_d * sum_g min(q_gd, 0)
+    q_pos_sum = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+    q_neg_sum = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+
+    # Base pointer for the first Q head in this KV group.
+    qh_base = kv_hid * kv_group_num
+    q_ptr_base = Q + bid * stride_qb + qh_base * stride_qh + offs_d * stride_qd
+    for g in range(kv_group_num):
+        q = tl.load(
+            q_ptr_base + g * stride_qh,
+            mask=mask_d,
+            other=0.0,
+        ).to(tl.float32)
+        q_pos_sum += tl.maximum(q, 0.0)
+        q_neg_sum += tl.minimum(q, 0.0)
+
     # 遍历该 split 覆盖的所有 page（仅 [0, valid_pages-1]）
+    pool_row = tl.load(Req_pool_indices + bid)
     for pid in range(split_start, split_end):
         # 通过 req_to_token 获得全局 page id
         token_offset_in_seq = pid * page_size
-        pool_row = tl.load(Req_pool_indices + bid)
         global_token_idx = tl.load(
             Req_to_token + pool_row * stride_rb + token_offset_in_seq
         )
@@ -905,7 +924,7 @@ def quest_estimate_split_kernel_grouped(
             + 0,
             mask=mask_d,
             other=0.0,
-        )
+        ).to(tl.float32)
         k_max = tl.load(
             K_metadata
             + global_page_idx * stride_mp
@@ -914,31 +933,11 @@ def quest_estimate_split_kernel_grouped(
             + 1,
             mask=mask_d,
             other=0.0,
-        )
+        ).to(tl.float32)
 
-        # 对该 KV 组内的所有 Q heads 累加 score
-        group_score = tl.zeros((), dtype=tl.float32)
-
-        # kv_group_num 是 constexpr，循环会被 Triton 展开：
-        # 对于每个组内 Q head：
-        for g in range(kv_group_num):
-            # 该组内 Q head 的全局索引 h_q
-            hq = kv_hid * kv_group_num + g
-
-            # 加载该 Q head 的向量 q[b, h_q, :]
-            q = tl.load(
-                Q + bid * stride_qb + hq * stride_qh + offs_d * stride_qd,
-                mask=mask_d,
-                other=0.0,
-            )
-
-            # Σ_d max(q_d * k_min_d, q_d * k_max_d)
-            qk_min = q * k_min
-            qk_max = q * k_max
-            score_per_dim = tl.maximum(qk_min, qk_max)
-            score_i = tl.sum(score_per_dim, axis=0)
-
-            group_score += score_i
+        # Compute group score for this page using precomputed Q sums.
+        score_per_dim = q_pos_sum * k_max + q_neg_sum * k_min
+        group_score = tl.sum(score_per_dim, axis=0)
 
         # 将 group_score 写回到该 KV 组的 Estimated_scores 槽位（不再按 Q head 扩展）
         tl.store(
