@@ -14,6 +14,15 @@
 !/exp/harness/analysis.ipynb
 !/exp/harness/log_parser.py
 
+!/exp/bench/
+/exp/bench/*
+!/exp/bench/onebatch/
+/exp/bench/onebatch/*
+!/exp/bench/onebatch/bench_gen.py
+!/exp/bench/onebatch/check_frac.py
+!/exp/bench/onebatch/log_parser.py
+!/exp/bench/onebatch/analysis.ipynb
+
 !/double_sparsity/
 /double_sparsity/*
 !/double_sparsity/calib.py
