@@ -13,6 +13,7 @@ Quest Attention Triton Kernels
 """
 
 import os
+import math
 import torch
 import triton
 import triton.language as tl
@@ -844,6 +845,7 @@ def quest_estimate_split_kernel_grouped(
     BLOCK_DMODEL: tl.constexpr,
     NUM_SPLITS: tl.constexpr,     # 固定 splits 数量（如 8/16/32）
     kv_group_num: tl.constexpr,   # = num_q_heads // num_kv_heads
+    PAGE_SHIFT: tl.constexpr,     # log2(page_size) if page_size is power-of-two; otherwise -1
 ):
     """
     Strong-GQA Estimate（split 版本，按 KV 组聚合）。
@@ -912,28 +914,24 @@ def quest_estimate_split_kernel_grouped(
         token_offset_in_seq = pid * page_size
         global_token_idx = tl.load(
             Req_to_token + pool_row * stride_rb + token_offset_in_seq
-        )
-        global_page_idx = global_token_idx // page_size
+        ).to(tl.int32)
+        # Fast path: if page_size is power-of-two, use bit shift instead of integer division.
+        if PAGE_SHIFT >= 0:
+            global_page_idx = global_token_idx >> PAGE_SHIFT
+        else:
+            global_page_idx = global_token_idx // page_size
 
         # 加载该 page 的 metadata（按 KV head 维度）
-        k_min = tl.load(
+        # NOTE: Some Triton versions don't support slicing a 2D tl.load result (e.g., k_mm[:, 0]).
+        # Keep shared address math but load min/max separately for compatibility.
+        k_ptr = (
             K_metadata
             + global_page_idx * stride_mp
             + kv_hid * stride_mh
             + offs_d * stride_md
-            + 0,
-            mask=mask_d,
-            other=0.0,
-        ).to(tl.float32)
-        k_max = tl.load(
-            K_metadata
-            + global_page_idx * stride_mp
-            + kv_hid * stride_mh
-            + offs_d * stride_md
-            + 1,
-            mask=mask_d,
-            other=0.0,
-        ).to(tl.float32)
+        )
+        k_min = tl.load(k_ptr + 0, mask=mask_d, other=0.0).to(tl.float32)
+        k_max = tl.load(k_ptr + 1, mask=mask_d, other=0.0).to(tl.float32)
 
         # Compute group score for this page using precomputed Q sums.
         score_per_dim = q_pos_sum * k_max + q_neg_sum * k_min
@@ -1048,6 +1046,8 @@ def quest_estimate_scores_triton(
 
     # 计算 grid 和 block 配置（head_dim 向上取 2 的幂，方便 Triton 向量化）
     BLOCK_DMODEL = triton.next_power_of_2(head_dim)
+    # For page_size division: use bitshift when page_size is power-of-two.
+    PAGE_SHIFT = int(math.log2(page_size)) if (page_size & (page_size - 1) == 0) else -1
 
     # Splits 配置：固定 NUM_SPLITS，kernel 内部循环 pages。
     # num_page_splits 是一个较小的常数（如 8/16/32），用于在 page 维做粗
@@ -1149,6 +1149,7 @@ def quest_estimate_scores_triton(
                 BLOCK_DMODEL=BLOCK_DMODEL,
                 NUM_SPLITS=num_page_splits,
                 kv_group_num=kv_group_num,
+                PAGE_SHIFT=PAGE_SHIFT,
                 num_warps=4,
                 num_stages=2,
             )
